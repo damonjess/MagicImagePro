@@ -12,4 +12,18 @@
 /captures
 .externalNativeBuild
 .cxx
-local.properties
+.kotlin/
+
+# Large file exclusions
+*.zip
+*.tar
+*.gz
+*.7z
+*.exe
+*.dll
+*.so
+*.mp4
+*.mov
+*.bin
+*.apk
+*.aab
