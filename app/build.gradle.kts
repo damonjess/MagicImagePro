@@ -1,6 +1,6 @@
 plugins {
     alias(libs.plugins.android.application)
-    id("org.jetbrains.kotlin.android") version "2.1.0"
+    alias(libs.plugins.kotlin.android)
 }
 
 android {
@@ -16,9 +16,8 @@ android {
         
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
-        // Prevent compression issues with large assets
         ndk {
-            abiFilters += listOf("arm64-v8a")
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
         }
     }
 
@@ -26,12 +25,11 @@ android {
         viewBinding = true
     }
 
-    @Suppress("DEPRECATION")
-    aaptOptions {
-        noCompress("tflite")
+    androidResources {
+        noCompress += "tflite"
     }
 
-    packagingOptions {
+    packaging {
         jniLibs {
             useLegacyPackaging = true
         }
@@ -48,14 +46,14 @@ android {
 }
 
 dependencies {
-    // Core
-    implementation("androidx.core:core-ktx:1.13.1")
-    implementation("androidx.appcompat:appcompat:1.7.0")
-    implementation("com.google.android.material:material:1.12.0")
-    implementation("androidx.constraintlayout:constraintlayout:2.1.4")
+    implementation(libs.androidx.core.ktx)
+    implementation(libs.androidx.appcompat)
+    implementation(libs.google.material)
+    implementation(libs.androidx.constraintlayout)
 
-    // TFLite
-    implementation("org.tensorflow:tensorflow-lite:2.17.0")
-    implementation("org.tensorflow:tensorflow-lite-gpu:2.17.0")
-    implementation("org.tensorflow:tensorflow-lite-support:0.5.0")
+    // TensorFlow Lite
+    implementation(libs.tensorflow.lite)
+    implementation(libs.tensorflow.lite.gpu)
+    implementation(libs.tensorflow.lite.gpu.api)
+    implementation(libs.tensorflow.lite.support)
 }
