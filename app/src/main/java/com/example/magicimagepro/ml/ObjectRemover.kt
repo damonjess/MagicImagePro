@@ -8,7 +8,7 @@ import android.graphics.Rect
 import org.tensorflow.lite.DataType
 import org.tensorflow.lite.support.tensorbuffer.TensorBuffer
 
-class ObjectRemover(context: Context) : TFLiteModel(context, "lama_dilated-tflite-float.tflite") {
+class ObjectRemover(context: Context) : TFLiteModel(context, "lama_dilated.tflite") {
     
     private val inputSize = 512
     
