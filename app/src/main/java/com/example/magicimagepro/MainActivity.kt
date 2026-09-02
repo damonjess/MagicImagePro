@@ -119,9 +119,21 @@ class MainActivity : AppCompatActivity() {
     
     private fun loadImage(uri: Uri) {
         lifecycleScope.launch(Dispatchers.IO) {
-            val stream = contentResolver.openInputStream(uri)
-            val bitmap = BitmapFactory.decodeStream(stream)
-            stream?.close()
+            val inputStream = contentResolver.openInputStream(uri)
+            val rawBitmap = BitmapFactory.decodeStream(inputStream)
+            inputStream?.close()
+
+            // Downscale massive 4000px camera photos to max 1600px
+            val maxDimension = 1600
+            val bitmap = if (rawBitmap != null && (rawBitmap.width > maxDimension || rawBitmap.height > maxDimension)) {
+                val scale = maxDimension.toFloat() / maxOf(rawBitmap.width, rawBitmap.height)
+                val w = (rawBitmap.width * scale).toInt()
+                val h = (rawBitmap.height * scale).toInt()
+                Bitmap.createScaledBitmap(rawBitmap, w, h, true).also { rawBitmap.recycle() }
+            } else {
+                rawBitmap
+            }
+
             withContext(Dispatchers.Main) {
                 bitmap?.let {
                     currentBitmap = it

@@ -51,9 +51,10 @@ dependencies {
     implementation(libs.google.material)
     implementation(libs.androidx.constraintlayout)
 
-    // TensorFlow Lite
     implementation(libs.tensorflow.lite)
-    implementation(libs.tensorflow.lite.gpu)
-    implementation(libs.tensorflow.lite.gpu.api)
     implementation(libs.tensorflow.lite.support)
+    implementation(libs.tensorflow.lite.gpu)
+
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("com.google.code.gson:gson:2.10.1")
 }
