@@ -6,6 +6,7 @@ plugins {
 android {
     namespace = "com.example.magicimagepro"
     compileSdk = 35
+    ndkVersion = "27.0.12077973"
 
     defaultConfig {
         applicationId = "com.example.magicimagepro"
@@ -16,8 +17,21 @@ android {
         
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
+        externalNativeBuild {
+            cmake {
+                cppFlags += ""
+            }
+        }
+
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
         }
     }
 

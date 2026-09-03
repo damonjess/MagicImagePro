@@ -15,6 +15,7 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.updatePadding
 import androidx.lifecycle.lifecycleScope
 import com.example.magicimagepro.databinding.ActivityMainBinding
+import com.example.magicimagepro.ml.NativeProcessor
 import com.example.magicimagepro.ml.ObjectRemover
 import com.example.magicimagepro.ui.ToolMode
 import kotlinx.coroutines.Dispatchers
@@ -87,26 +88,18 @@ class MainActivity : AppCompatActivity() {
         
         binding.btnProcess.setOnClickListener {
             val image = currentBitmap ?: return@setOnClickListener
-            val mask = binding.maskView.getMaskBitmap() ?: return@setOnClickListener
-            
-            binding.progressBar.visibility = View.VISIBLE
-            lifecycleScope.launch(Dispatchers.Default) {
-                try {
-                    val remover = objectRemover ?: throw Exception("Model loading")
-                    val result = remover.removeObject(image, mask)
-                    withContext(Dispatchers.Main) {
-                        currentBitmap = result
-                        binding.imageView.setImageBitmap(result)
-                        binding.maskView.setImage(result) 
-                        binding.progressBar.visibility = View.GONE
-                    }
-                } catch (e: Exception) {
-                    withContext(Dispatchers.Main) { 
-                        Toast.makeText(this@MainActivity, "Error: ${e.message}", Toast.LENGTH_SHORT).show()
-                        binding.progressBar.visibility = View.GONE 
-                    }
-                }
-            }
+            val rawMask = binding.maskView.getMaskBitmap() ?: return@setOnClickListener
+
+            // Force the mask dimensions to match the image precisely
+            val mask = Bitmap.createScaledBitmap(rawMask, image.width, image.height, true)
+            val resultBitmap = Bitmap.createBitmap(image.width, image.height, Bitmap.Config.ARGB_8888)
+
+            val processor = NativeProcessor()
+            processor.processImage(image, mask, resultBitmap)
+
+            currentBitmap = resultBitmap
+            binding.imageView.setImageBitmap(resultBitmap)
+            binding.maskView.setImage(resultBitmap)
         }
     }
     
