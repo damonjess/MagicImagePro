@@ -130,23 +130,87 @@ class MaskDrawingView @JvmOverloads constructor(
     }
     
     fun getMaskBitmap(): Bitmap? {
-        exportMaskCanvas?.drawColor(Color.BLACK, PorterDuff.Mode.CLEAR)
-        exportMaskCanvas?.drawColor(Color.BLACK) // Black background
-        
-        val exportPaint = Paint(basePaint).apply { color = Color.WHITE }
-        val eraserPaint = Paint(basePaint).apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.CLEAR) }
-        
+        val export = exportMaskBitmap ?: return null
+        val w = export.width
+        val h = export.height
+        val cv = exportMaskCanvas ?: return null
+
+        cv.drawColor(Color.BLACK, PorterDuff.Mode.CLEAR)
+        cv.drawColor(Color.BLACK)
+
+        val exportPaint = Paint(basePaint).apply {
+            color = Color.WHITE
+            isFilterBitmap = false
+            isAntiAlias = true
+        }
+        val eraserPaint = Paint(basePaint).apply {
+            xfermode = PorterDuffXfermode(PorterDuff.Mode.CLEAR)
+            isFilterBitmap = false
+            isAntiAlias = true
+        }
+        val fillPaint = Paint(basePaint).apply {
+            color = Color.WHITE
+            style = Paint.Style.FILL
+            isFilterBitmap = false
+            isAntiAlias = true
+        }
+
         for (action in actionStack) {
-            exportPaint.strokeWidth = action.size
-            eraserPaint.strokeWidth = action.size
-            
+            val sz = action.size
+            exportPaint.strokeWidth = sz
+            eraserPaint.strokeWidth = sz
+
             when (action.mode) {
-                ToolMode.BRUSH -> { exportPaint.style = Paint.Style.STROKE; exportMaskCanvas?.drawPath(action.path, exportPaint) }
-                ToolMode.LASSO -> { exportPaint.style = Paint.Style.FILL_AND_STROKE; exportMaskCanvas?.drawPath(action.path, exportPaint) }
-                ToolMode.ERASER -> { eraserPaint.style = Paint.Style.STROKE; exportMaskCanvas?.drawPath(action.path, eraserPaint) }
+                ToolMode.BRUSH -> {
+                    exportPaint.style = Paint.Style.STROKE
+                    exportPaint.strokeCap = Paint.Cap.ROUND
+                    exportPaint.strokeJoin = Paint.Join.ROUND
+                    cv.drawPath(action.path, exportPaint)
+                }
+                ToolMode.LASSO -> {
+                    cv.drawPath(action.path, fillPaint)
+                }
+                ToolMode.ERASER -> {
+                    eraserPaint.style = Paint.Style.STROKE
+                    eraserPaint.strokeCap = Paint.Cap.ROUND
+                    eraserPaint.strokeJoin = Paint.Join.ROUND
+                    cv.drawPath(action.path, eraserPaint)
+                }
             }
         }
-        return exportMaskBitmap
+
+        val thickenPaint = Paint(basePaint).apply {
+            color = Color.WHITE
+            style = Paint.Style.STROKE
+            strokeCap = Paint.Cap.ROUND
+            strokeJoin = Paint.Join.ROUND
+        }
+
+        for (action in actionStack) {
+            if (action.mode == ToolMode.BRUSH) {
+                val extra = (action.size * 0.15f).coerceAtLeast(1.2f)
+                thickenPaint.strokeWidth = action.size + extra
+                val overlay = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+                val oc = Canvas(overlay)
+                oc.drawPath(action.path, thickenPaint)
+                val overlayPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC_OVER)
+                    isFilterBitmap = false
+                }
+                cv.drawBitmap(overlay, 0f, 0f, overlayPaint)
+                overlay.recycle()
+            }
+        }
+
+        val pixels = IntArray(w * h)
+        export.getPixels(pixels, 0, w, 0, 0, w, h)
+        for (i in pixels.indices) {
+            val r = Color.red(pixels[i])
+            pixels[i] = if (r > 85) Color.WHITE else Color.BLACK
+        }
+        export.setPixels(pixels, 0, w, 0, 0, w, h)
+
+        return export
     }
 
     fun clearMask() {

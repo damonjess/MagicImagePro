@@ -18,8 +18,10 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.updatePadding
 import androidx.lifecycle.lifecycleScope
 import com.example.magicimagepro.databinding.ActivityMainBinding
+import com.example.magicimagepro.ml.ImageUpscaler
 import com.example.magicimagepro.ml.NativeProcessor
 import com.example.magicimagepro.ml.ObjectRemover
+import com.example.magicimagepro.ml.ObjectSnapper
 import com.example.magicimagepro.ui.ToolMode
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -31,6 +33,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
     private var currentBitmap: Bitmap? = null
     private var objectRemover: ObjectRemover? = null
+    @Suppress("unused")
+    private var objectSnapper: ObjectSnapper? = null
+    @Suppress("unused")
+    private var imageUpscaler: ImageUpscaler? = null
     private var mInterstitialAd: Any? = null
     private val nativeProcessor = NativeProcessor()
     
@@ -198,5 +204,7 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
         // Free the native C++ memory held by TensorFlow Lite
         objectRemover?.close()
+        objectSnapper?.close()
+        imageUpscaler?.close()
     }
 }
