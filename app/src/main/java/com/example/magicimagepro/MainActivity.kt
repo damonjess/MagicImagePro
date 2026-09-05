@@ -47,7 +47,6 @@ class MainActivity : AppCompatActivity() {
     private val imagePicker = registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
         uri?.let { 
             loadImage(it)
-            updateEmptyState(true)
         }
     }
     
@@ -242,6 +241,7 @@ class MainActivity : AppCompatActivity() {
                     currentBitmap = it
                     binding.imageView.setImageBitmap(it)
                     binding.maskView.setImage(it)
+                    updateEmptyState(true)
                 }
             }
         }
@@ -249,6 +249,8 @@ class MainActivity : AppCompatActivity() {
 
     private fun updateEmptyState(isImageLoaded: Boolean) {
         binding.btnEmptyState.visibility = if (isImageLoaded) View.GONE else View.VISIBLE
+        binding.imageView.visibility = if (isImageLoaded) View.VISIBLE else View.GONE
+        binding.maskView.visibility = if (isImageLoaded) View.VISIBLE else View.GONE
     }
 
     private fun applyWindowInsets() {

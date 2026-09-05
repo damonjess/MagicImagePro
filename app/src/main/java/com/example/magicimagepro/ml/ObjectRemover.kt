@@ -152,28 +152,45 @@ class ObjectRemover(context: Context) : TFLiteModel(context, "lama_dilated-tflit
         val maskBuf = ByteBuffer.allocateDirect(4 * modelWidth * modelHeight * 1).order(ByteOrder.nativeOrder())
         val outputBuf = ByteBuffer.allocateDirect(4 * modelWidth * modelHeight * 3).order(ByteOrder.nativeOrder())
 
-        val inputShape = interpreter.getInputTensor(0).shape()
-        val isNchwInput = inputShape != null && inputShape.size == 4 && inputShape[1] == 3
+        val inputCount = interpreter.inputTensorCount
+        require(inputCount == 2) { "LaMa model must have image and mask inputs" }
+        val imageInputIndex = (0 until inputCount).firstOrNull { index ->
+            val name = interpreter.getInputTensor(index).name().lowercase()
+            name.contains("painted") || name.contains("image")
+        } ?: 0
+        val maskInputIndex = (0 until inputCount).firstOrNull { index ->
+            interpreter.getInputTensor(index).name().lowercase().contains("mask")
+        } ?: (1 - imageInputIndex)
+        require(imageInputIndex != maskInputIndex) { "LaMa image and mask inputs are ambiguous" }
 
-        fillInputBuffers(scaledImg, scaledMask, imgBuf, maskBuf, isNchwInput)
+        val imageShape = interpreter.getInputTensor(imageInputIndex).shape()
+        val maskShape = interpreter.getInputTensor(maskInputIndex).shape()
+        val imageIsNchw = imageShape.size == 4 && imageShape[1] == 3
+        val maskIsNchw = maskShape.size == 4 && maskShape[1] == 1
+
+        fillImageBuffer(scaledImg, imgBuf, imageIsNchw)
+        fillMaskBuffer(scaledMask, maskBuf, maskIsNchw)
         scaledImg.recycle()
         scaledMask.recycle()
 
         interpreter.runForMultipleInputsOutputs(
-            arrayOf(imgBuf, maskBuf),
+            arrayOf<Any>(imgBuf, maskBuf).also { inputs ->
+                inputs[imageInputIndex] = imgBuf
+                inputs[maskInputIndex] = maskBuf
+            },
             mapOf(0 to outputBuf)
         )
 
         val outputShape = interpreter.getOutputTensor(0).shape()
         val isNchwOutput = outputShape != null && outputShape.size == 4 && outputShape[1] == 3
 
-        val rawSquare = convertOutputToBitmap(outputBuf, squareSize, squareSize, isNchwOutput)
+        val rawSquare = convertOutputToBitmap(outputBuf, modelWidth, modelHeight, isNchwOutput)
 
-        val cropL = padL
-        val cropT = padT
-        val cropR = squareSize - padR
-        val cropB = squareSize - padB
-        val cropped = if (cropL == 0 && cropT == 0 && cropR == squareSize && cropB == squareSize) {
+        val cropL = (padL * modelWidth / squareSize).coerceIn(0, modelWidth - 1)
+        val cropT = (padT * modelHeight / squareSize).coerceIn(0, modelHeight - 1)
+        val cropR = (modelWidth - padR * modelWidth / squareSize).coerceIn(cropL + 1, modelWidth)
+        val cropB = (modelHeight - padB * modelHeight / squareSize).coerceIn(cropT + 1, modelHeight)
+        val cropped = if (cropL == 0 && cropT == 0 && cropR == modelWidth && cropB == modelHeight) {
             rawSquare
         } else {
             val cw = cropR - cropL
@@ -189,20 +206,13 @@ class ObjectRemover(context: Context) : TFLiteModel(context, "lama_dilated-tflit
         return resized
     }
 
-    private fun fillInputBuffers(
-        img: Bitmap, mask: Bitmap,
-        imgBuf: ByteBuffer, maskBuf: ByteBuffer,
-        isNchw: Boolean
-    ) {
+    private fun fillImageBuffer(img: Bitmap, imgBuf: ByteBuffer, isNchw: Boolean) {
         val w = img.width
         val h = img.height
         val total = w * h
         val iPx = IntArray(total)
-        val mPx = IntArray(total)
         img.getPixels(iPx, 0, w, 0, 0, w, h)
-        mask.getPixels(mPx, 0, w, 0, 0, w, h)
         imgBuf.rewind()
-        maskBuf.rewind()
 
         if (isNchw) {
             for (i in 0 until total) {
@@ -214,9 +224,6 @@ class ObjectRemover(context: Context) : TFLiteModel(context, "lama_dilated-tflit
             for (i in 0 until total) {
                 imgBuf.putFloat(Color.blue(iPx[i]) / 255f)
             }
-            for (i in 0 until total) {
-                maskBuf.putFloat(if (isMaskPixel(mPx[i])) 1f else 0f)
-            }
         } else {
             for (i in 0 until total) {
                 val c = iPx[i]
@@ -224,8 +231,20 @@ class ObjectRemover(context: Context) : TFLiteModel(context, "lama_dilated-tflit
                 imgBuf.putFloat(Color.green(c) / 255f)
                 imgBuf.putFloat(Color.blue(c) / 255f)
 
-                maskBuf.putFloat(if (isMaskPixel(mPx[i])) 1f else 0f)
             }
+        }
+    }
+
+    private fun fillMaskBuffer(mask: Bitmap, maskBuf: ByteBuffer, isNchw: Boolean) {
+        val w = mask.width
+        val h = mask.height
+        val total = w * h
+        val mPx = IntArray(total)
+        mask.getPixels(mPx, 0, w, 0, 0, w, h)
+        maskBuf.rewind()
+
+        for (i in 0 until total) {
+            maskBuf.putFloat(if (isMaskPixel(mPx[i])) 1f else 0f)
         }
     }
 
