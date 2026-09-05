@@ -8,7 +8,17 @@ class NativeProcessor {
 
     companion object {
         init {
-            System.loadLibrary("native-lib")
+            try {
+                System.loadLibrary("c++_shared")
+            } catch (_: UnsatisfiedLinkError) {
+                // Ignore if already loaded or statically linked
+            }
+            try {
+                System.loadLibrary("opencv_java4")
+            } catch (_: UnsatisfiedLinkError) {
+                // Ignore if loaded automatically by linker
+            }
+            System.loadLibrary("removal_engine")
         }
     }
 }
