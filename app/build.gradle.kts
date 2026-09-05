@@ -1,9 +1,8 @@
-import java.util.Properties
-import java.io.FileInputStream
+import java.net.URI
 
 plugins {
-    id("com.android.application")
-    id("org.jetbrains.kotlin.android")
+    alias(libs.plugins.android.application)
+    alias(libs.plugins.kotlin.android)
 }
 
 android {
@@ -12,52 +11,119 @@ android {
 
     defaultConfig {
         applicationId = "com.example.magicimagepro"
-        minSdk = 24
+        minSdk = 26
         targetSdk = 35
         versionCode = 1
         versionName = "1.0"
         
-        val localProperties = Properties()
-        val localPropertiesFile = rootProject.file("local.properties")
-        if (localPropertiesFile.exists()) {
-            localProperties.load(FileInputStream(localPropertiesFile))
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        ndk {
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
         }
-        val hfApiKey = localProperties.getProperty("HF_API_KEY", "")
-        buildConfigField("String", "HF_API_KEY", "\"$hfApiKey\"")
+
+        externalNativeBuild {
+            cmake {
+                cppFlags += ""
+                arguments += "-DOpenCV_DIR=/home/damon/OpenCV-android-sdk/sdk/native/jni"
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
     }
 
     buildFeatures {
         viewBinding = true
-        buildConfig = true
+        prefab = true
+    }
+
+    androidResources {
+        noCompress += "tflite"
+    }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
     }
 
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_1_8
-        targetCompatibility = JavaVersion.VERSION_1_8
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
     }
+
     kotlinOptions {
-        jvmTarget = "1.8"
+        jvmTarget = "17"
     }
 }
 
 dependencies {
-    // Core Android & UI
-    implementation("androidx.core:core-ktx:1.13.1")
-    implementation("androidx.appcompat:appcompat:1.7.0")
-    implementation("com.google.android.material:material:1.12.0")
-    implementation("androidx.constraintlayout:constraintlayout:2.1.4")
+    implementation(libs.androidx.core.ktx)
+    implementation(libs.androidx.appcompat)
+    implementation(libs.google.material)
+    implementation(libs.androidx.constraintlayout)
 
-    // Google AdMob
-    implementation("com.google.android.gms:play-services-ads:23.1.0")
-
-    // Networking (OkHttp for the Cloud API)
-    implementation("com.squareup.okhttp3:okhttp:4.12.0")
-
-    // Kotlin Coroutines for async background tasks
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.0")
-
-    // TensorFlow Lite
     implementation(libs.tensorflow.lite)
     implementation(libs.tensorflow.lite.support)
     implementation(libs.tensorflow.lite.gpu)
+
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("com.google.code.gson:gson:2.10.1")
+    implementation("com.alibaba.android:mnn:0.0.8")
+
+    testImplementation("junit:junit:4.13.2")
+    androidTestImplementation("androidx.test.ext:junit:1.1.5")
+    androidTestImplementation("androidx.test.espresso:espresso-core:3.5.1")
+}
+
+val copyTfliteSo by tasks.registering(Copy::class) {
+    val cfg = configurations.detachedConfiguration(dependencies.create("org.tensorflow:tensorflow-lite:2.17.0"))
+    duplicatesStrategy = DuplicatesStrategy.WARN
+    from({
+        cfg.files.map { zipTree(it) }
+    }) {
+        include("jni/**/libtensorflowlite_jni.so", "jni/**/libtensorflowlite.so")
+        eachFile {
+            val abi = file.parentFile.name
+            path = "$abi/libtensorflowlite.so"
+        }
+        includeEmptyDirs = false
+    }
+    into(layout.projectDirectory.dir("src/main/jniLibs"))
+}
+
+val downloadTfliteHeaders by tasks.registering {
+    val destDir = layout.projectDirectory.dir("src/main/cpp/include")
+    outputs.dir(destDir)
+    doLast {
+        val baseUrl = "https://raw.githubusercontent.com/tensorflow/tensorflow/v2.17.0/"
+        val relativePaths = listOf(
+            "tensorflow/lite/c/c_api.h",
+            "tensorflow/lite/c/c_api_types.h",
+            "tensorflow/lite/c/common.h",
+            "tensorflow/lite/core/c/c_api.h",
+            "tensorflow/lite/core/c/c_api_types.h",
+            "tensorflow/lite/core/c/common.h",
+            "tensorflow/lite/builtin_ops.h"
+        )
+        relativePaths.forEach { relPath ->
+            val file = destDir.file(relPath).asFile
+            if (!file.exists()) {
+                file.parentFile.mkdirs()
+                println("Downloading $relPath...")
+                val bytes = URI(baseUrl + relPath).toURL().readBytes()
+                file.writeBytes(bytes)
+            }
+        }
+    }
+}
+
+tasks.named("preBuild") {
+    dependsOn(copyTfliteSo)
+    dependsOn(downloadTfliteHeaders)
 }
