@@ -1,15 +1,16 @@
 package com.example.magicimagepro
 
+import android.content.ContentValues
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.Environment
+import android.provider.MediaStore
 import android.view.View
 import android.widget.Toast
-import java.io.File
-import java.io.FileOutputStream
-import android.content.Context
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
@@ -89,7 +90,14 @@ class MainActivity : AppCompatActivity() {
         // Central Empty State Button
         binding.btnEmptyState.setOnClickListener { imagePicker.launch("image/*") }
         
-        binding.btnSave.setOnClickListener { Toast.makeText(this, "Add save logic", Toast.LENGTH_SHORT).show() }
+        binding.btnSave.setOnClickListener {
+            val bitmap = currentBitmap
+            if (bitmap != null) {
+                saveImageToGallery(bitmap)
+            } else {
+                Toast.makeText(this, "No image to save", Toast.LENGTH_SHORT).show()
+            }
+        }
         
         binding.btnUndo.setOnClickListener { binding.maskView.undo() }
         binding.btnRedo.setOnClickListener { binding.maskView.redo() }
@@ -102,15 +110,26 @@ class MainActivity : AppCompatActivity() {
         binding.btnEraser.setOnClickListener { setTool(ToolMode.ERASER) }
         
         binding.btnProcess.setOnClickListener {
-            val image = currentBitmap ?: return@setOnClickListener
+            val image = currentBitmap ?: run {
+                Toast.makeText(this, "Please select or take a photo first", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
             val rawMask = binding.maskView.getMaskBitmap() ?: return@setOnClickListener
-            
+
+            if (isMaskEmpty(rawMask)) {
+                Toast.makeText(this, "Please draw a mask over the object to remove", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+
             binding.progressBar.visibility = View.VISIBLE
-            
-            // 1. Offload the heavy AI math and image blending to the CPU-optimized Default thread
+
             val deferredResult = lifecycleScope.async(Dispatchers.Default) {
                 try {
-                    val mask = Bitmap.createScaledBitmap(rawMask, image.width, image.height, true)
+                    val mask = if (rawMask.width != image.width || rawMask.height != image.height) {
+                        Bitmap.createScaledBitmap(rawMask, image.width, image.height, true)
+                    } else {
+                        rawMask
+                    }
                     val remover = objectRemover
                     val result = if (remover != null) {
                         remover.removeObject(image, mask)
@@ -119,34 +138,81 @@ class MainActivity : AppCompatActivity() {
                         nativeProcessor.processImage(image, mask, fallback)
                         fallback
                     }
+                    if (mask != rawMask) {
+                        mask.recycle()
+                    }
                     Result.success(result)
                 } catch (e: Exception) {
                     Result.failure(e)
                 }
             }
-            
-            // 2. Show the interstitial ad if available, otherwise wait for AI and update UI
-            val ad = mInterstitialAd
-            if (ad != null) {
-                // Interstitial ad handling if enabled
-            } else {
-                lifecycleScope.launch(Dispatchers.Main) {
-                    val result = deferredResult.await()
-                    
-                    result.onSuccess { bitmap ->
-                        currentBitmap = bitmap
-                        binding.imageView.setImageBitmap(bitmap)
-                        binding.maskView.setImage(bitmap)
-                    }.onFailure { e ->
-                        Toast.makeText(this@MainActivity, "Inference Error: ${e.message}", Toast.LENGTH_LONG).show()
-                    }
-                    
-                    binding.progressBar.visibility = View.GONE
+
+            lifecycleScope.launch(Dispatchers.Main) {
+                val result = deferredResult.await()
+
+                result.onSuccess { bitmap ->
+                    currentBitmap = bitmap
+                    binding.imageView.setImageBitmap(bitmap)
+                    binding.maskView.setImage(bitmap)
+                }.onFailure { e ->
+                    e.printStackTrace()
+                    val errorMsg = e.localizedMessage ?: e::class.simpleName ?: "Unknown error"
+                    Toast.makeText(this@MainActivity, "Inference Error: $errorMsg", Toast.LENGTH_LONG).show()
                 }
+
+                binding.progressBar.visibility = View.GONE
             }
         }
     }
     
+    private fun isMaskEmpty(mask: Bitmap): Boolean {
+        val w = mask.width
+        val h = mask.height
+        val step = maxOf(1, maxOf(w, h) / 200)
+        val pixels = IntArray(w * h)
+        mask.getPixels(pixels, 0, w, 0, 0, w, h)
+        for (i in 0 until w * h step step) {
+            val c = pixels[i]
+            if (Color.red(c) > 50 || Color.green(c) > 50 || Color.blue(c) > 50 || Color.alpha(c) > 50) {
+                return false
+            }
+        }
+        return true
+    }
+
+    private fun saveImageToGallery(bitmap: Bitmap) {
+        try {
+            val filename = "MagicImagePro_${System.currentTimeMillis()}.png"
+            val resolver = contentResolver
+            val contentValues = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, filename)
+                put(MediaStore.MediaColumns.MIME_TYPE, "image/png")
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/MagicImagePro")
+                    put(MediaStore.MediaColumns.IS_PENDING, 1)
+                }
+            }
+
+            val imageUri = resolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
+            if (imageUri != null) {
+                resolver.openOutputStream(imageUri)?.use { stream ->
+                    bitmap.compress(Bitmap.CompressFormat.PNG, 100, stream)
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    contentValues.clear()
+                    contentValues.put(MediaStore.MediaColumns.IS_PENDING, 0)
+                    resolver.update(imageUri, contentValues, null, null)
+                }
+                Toast.makeText(this, "Saved to Pictures/MagicImagePro", Toast.LENGTH_SHORT).show()
+            } else {
+                Toast.makeText(this, "Failed to save image", Toast.LENGTH_SHORT).show()
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+            Toast.makeText(this, "Error saving image: ${e.localizedMessage}", Toast.LENGTH_SHORT).show()
+        }
+    }
+
     private fun setTool(mode: ToolMode) {
         binding.maskView.currentMode = mode
         binding.btnBrush.setTextColor(if (mode == ToolMode.BRUSH) activeColor else inactiveColor)
@@ -183,8 +249,6 @@ class MainActivity : AppCompatActivity() {
 
     private fun updateEmptyState(isImageLoaded: Boolean) {
         binding.btnEmptyState.visibility = if (isImageLoaded) View.GONE else View.VISIBLE
-        // Optionally show/hide top bar load buttons to reduce clutter when empty
-        // binding.topBar.visibility = if (isImageLoaded) View.VISIBLE else View.INVISIBLE
     }
 
     private fun applyWindowInsets() {

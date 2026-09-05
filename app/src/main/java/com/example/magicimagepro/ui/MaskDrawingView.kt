@@ -25,6 +25,7 @@ class MaskDrawingView @JvmOverloads constructor(
     var onTapListener: OnTapListener? = null
 
     private var imageBitmap: Bitmap? = null
+    private var baseMaskBitmap: Bitmap? = null
     var currentMode = ToolMode.BRUSH
     var brushSize = 60f
     var cursorOffset = 150f // Pushes the brush up from your finger
@@ -83,6 +84,9 @@ class MaskDrawingView @JvmOverloads constructor(
     fun setImage(bitmap: Bitmap) {
         imageBitmap = bitmap
         
+        baseMaskBitmap?.recycle()
+        baseMaskBitmap = null
+
         displayMaskBitmap = Bitmap.createBitmap(bitmap.width, bitmap.height, Bitmap.Config.ARGB_8888)
         displayMaskCanvas = Canvas(displayMaskBitmap!!)
         
@@ -118,15 +122,13 @@ class MaskDrawingView @JvmOverloads constructor(
         actionStack.clear()
         redoStack.clear()
 
-        exportMaskBitmap = scaledMask.copy(Bitmap.Config.ARGB_8888, true)
-        exportMaskCanvas = Canvas(exportMaskBitmap!!)
+        baseMaskBitmap?.recycle()
+        baseMaskBitmap = scaledMask.copy(Bitmap.Config.ARGB_8888, true)
         
-        displayMaskBitmap?.eraseColor(Color.TRANSPARENT)
-        val paint = Paint().apply {
-            colorFilter = PorterDuffColorFilter(maskColor, PorterDuff.Mode.SRC_IN)
-        }
-        displayMaskCanvas?.drawBitmap(exportMaskBitmap!!, 0f, 0f, paint)
-        invalidate()
+        exportMaskBitmap = Bitmap.createBitmap(bmp.width, bmp.height, Bitmap.Config.ARGB_8888)
+        exportMaskCanvas = Canvas(exportMaskBitmap!!)
+
+        redrawHistory()
     }
     
     fun getMaskBitmap(): Bitmap? {
@@ -137,6 +139,10 @@ class MaskDrawingView @JvmOverloads constructor(
 
         cv.drawColor(Color.BLACK, PorterDuff.Mode.CLEAR)
         cv.drawColor(Color.BLACK)
+
+        baseMaskBitmap?.let { base ->
+            cv.drawBitmap(base, 0f, 0f, null)
+        }
 
         val exportPaint = Paint(basePaint).apply {
             color = Color.WHITE
@@ -179,34 +185,13 @@ class MaskDrawingView @JvmOverloads constructor(
             }
         }
 
-        val thickenPaint = Paint(basePaint).apply {
-            color = Color.WHITE
-            style = Paint.Style.STROKE
-            strokeCap = Paint.Cap.ROUND
-            strokeJoin = Paint.Join.ROUND
-        }
-
-        for (action in actionStack) {
-            if (action.mode == ToolMode.BRUSH) {
-                val extra = (action.size * 0.15f).coerceAtLeast(1.2f)
-                thickenPaint.strokeWidth = action.size + extra
-                val overlay = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-                val oc = Canvas(overlay)
-                oc.drawPath(action.path, thickenPaint)
-                val overlayPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-                    xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC_OVER)
-                    isFilterBitmap = false
-                }
-                cv.drawBitmap(overlay, 0f, 0f, overlayPaint)
-                overlay.recycle()
-            }
-        }
-
         val pixels = IntArray(w * h)
         export.getPixels(pixels, 0, w, 0, 0, w, h)
         for (i in pixels.indices) {
             val r = Color.red(pixels[i])
-            pixels[i] = if (r > 85) Color.WHITE else Color.BLACK
+            val g = Color.green(pixels[i])
+            val a = Color.alpha(pixels[i])
+            pixels[i] = if (r > 85 || g > 85 || a > 85) Color.WHITE else Color.BLACK
         }
         export.setPixels(pixels, 0, w, 0, 0, w, h)
 
@@ -214,6 +199,8 @@ class MaskDrawingView @JvmOverloads constructor(
     }
 
     fun clearMask() {
+        baseMaskBitmap?.recycle()
+        baseMaskBitmap = null
         actionStack.clear()
         redoStack.clear()
         redrawHistory()
@@ -235,6 +222,14 @@ class MaskDrawingView @JvmOverloads constructor(
     
     private fun redrawHistory() {
         displayMaskBitmap?.eraseColor(Color.TRANSPARENT)
+
+        baseMaskBitmap?.let { base ->
+            val paint = Paint().apply {
+                colorFilter = PorterDuffColorFilter(maskColor, PorterDuff.Mode.SRC_IN)
+            }
+            displayMaskCanvas?.drawBitmap(base, 0f, 0f, paint)
+        }
+
         val paint = Paint(basePaint).apply { color = maskColor }
         val eraser = Paint(basePaint).apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.CLEAR) }
         
@@ -382,6 +377,7 @@ class MaskDrawingView @JvmOverloads constructor(
                 isDrawing = true
                 currentPath = Path()
                 currentPath.moveTo(mx, my)
+                currentPath.lineTo(mx, my)
                 redoStack.clear()
             }
             MotionEvent.ACTION_MOVE -> {
