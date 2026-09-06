@@ -134,8 +134,12 @@ class ObjectRemover(context: Context) : TFLiteModel(context, "lama_dilated-tflit
     // Model runner
     // ---------------------------------------------------------------------
 
+    // Decide "selected" by LUMINANCE only, never by alpha. The mask is a binary image:
+    // opaque white = selected (to inpaint), opaque black = keep. Checking alpha would
+    // treat the opaque-black background (alpha 255) as selected and flood the whole
+    // image into the model as a hole, producing a white result.
     private fun isMaskPixel(c: Int): Boolean {
-        return Color.red(c) > 127 || Color.green(c) > 127 || Color.alpha(c) > 127
+        return Color.red(c) > 127 || Color.green(c) > 127 || Color.blue(c) > 127
     }
 
     private fun runLaMaOnBitmap(input: Bitmap, inputMask: Bitmap): Bitmap {

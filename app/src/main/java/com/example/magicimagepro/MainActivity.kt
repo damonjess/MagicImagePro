@@ -176,7 +176,9 @@ class MainActivity : AppCompatActivity() {
         mask.getPixels(pixels, 0, w, 0, 0, w, h)
         for (i in 0 until w * h step step) {
             val c = pixels[i]
-            if (Color.red(c) > 50 || Color.green(c) > 50 || Color.blue(c) > 50 || Color.alpha(c) > 50) {
+            // Luminance only: the mask background is opaque black (alpha 255), so an alpha
+            // check would never detect an empty mask. White = something was drawn.
+            if (Color.red(c) > 50 || Color.green(c) > 50 || Color.blue(c) > 50) {
                 return false
             }
         }

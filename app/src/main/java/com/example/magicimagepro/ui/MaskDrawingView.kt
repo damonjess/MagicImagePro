@@ -185,13 +185,17 @@ class MaskDrawingView @JvmOverloads constructor(
             }
         }
 
+        // Binarize by LUMINANCE only, never by alpha. The export canvas is filled with
+        // opaque black (alpha = 255), so an alpha check would mark every unselected pixel
+        // as selected and send the whole image to the model as one giant hole (-> white
+        // output). White strokes => selected (keep as WHITE), black background => not.
         val pixels = IntArray(w * h)
         export.getPixels(pixels, 0, w, 0, 0, w, h)
         for (i in pixels.indices) {
             val r = Color.red(pixels[i])
             val g = Color.green(pixels[i])
-            val a = Color.alpha(pixels[i])
-            pixels[i] = if (r > 85 || g > 85 || a > 85) Color.WHITE else Color.BLACK
+            val b = Color.blue(pixels[i])
+            pixels[i] = if (r > 85 || g > 85 || b > 85) Color.WHITE else Color.BLACK
         }
         export.setPixels(pixels, 0, w, 0, 0, w, h)
 
