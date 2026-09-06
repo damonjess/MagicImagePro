@@ -25,7 +25,6 @@ android {
         externalNativeBuild {
             cmake {
                 cppFlags += ""
-                arguments += "-DOpenCV_DIR=/home/damon/OpenCV-android-sdk/sdk/native/jni"
             }
         }
     }

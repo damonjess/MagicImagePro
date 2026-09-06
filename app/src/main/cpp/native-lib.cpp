@@ -46,18 +46,17 @@ static inline cv::Mat inpaintHybrid(const cv::Mat& srcRgb, const cv::Mat& maskFu
     cv::magnitude(sobelX, sobelY, edgeMask);
     edgeMask = edgeMask / 255.0;
 
-    cv::Mat blendW = cv::Mat::ones(srcRgb.size(), CV_32F) * 0.55f;
+    cv::Mat blendW = cv::Mat::ones(srcRgb.size(), CV_32F) * 0.5f;
     for (int y = 0; y < srcRgb.rows; ++y) {
         for (int x = 0; x < srcRgb.cols; ++x) {
             if (maskFull.at<uchar>(y, x) > 0) {
-                float e = edgeMask.at<cv::Vec3f>(y, x)[0] +
-                          edgeMask.at<cv::Vec3f>(y, x)[1] +
-                          edgeMask.at<cv::Vec3f>(y, x)[2];
-                e /= 3.0f;
+                float e = (edgeMask.at<cv::Vec3f>(y, x)[0] +
+                           edgeMask.at<cv::Vec3f>(y, x)[1] +
+                           edgeMask.at<cv::Vec3f>(y, x)[2]) / 3.0f;
                 if (e < 0.05f) {
-                    blendW.at<float>(y, x) = 0.35f;
+                    blendW.at<float>(y, x) = 0.3f;
                 } else if (e > 0.2f) {
-                    blendW.at<float>(y, x) = 0.75f;
+                    blendW.at<float>(y, x) = 0.7f;
                 }
             } else {
                 blendW.at<float>(y, x) = 0.0f;
@@ -68,17 +67,14 @@ static inline cv::Mat inpaintHybrid(const cv::Mat& srcRgb, const cv::Mat& maskFu
     std::vector<cv::Mat> teleaCh, nsCh, outCh;
     cv::split(outTelea, teleaCh);
     cv::split(outNs, nsCh);
-    cv::split(srcRgb, outCh);
+    outCh.resize(3);
 
     for (size_t c = 0; c < 3; ++c) {
-        cv::Mat tF, nF, sF;
+        cv::Mat tF, nF;
         teleaCh[c].convertTo(tF, CV_32F);
         nsCh[c].convertTo(nF, CV_32F);
-        outCh[c].convertTo(sF, CV_32F);
         cv::Mat one = cv::Mat::ones(blendW.size(), CV_32F);
-        cv::Mat mixed = sF.mul(one - blendW) +
-                        tF.mul(blendW * cv::Scalar(0.6f)) +
-                        nF.mul(blendW * cv::Scalar(0.4f));
+        cv::Mat mixed = tF.mul(one - blendW) + nF.mul(blendW);
         mixed.convertTo(outCh[c], CV_8U);
     }
     cv::merge(outCh, combined);
@@ -103,15 +99,27 @@ Java_com_example_magicimagepro_ml_NativeProcessor_processImage(
     if (AndroidBitmap_getInfo(env, mask, &infoMask) != ANDROID_BITMAP_RESULT_SUCCESS) return -2;
     if (AndroidBitmap_getInfo(env, outBitmap, &infoOut) != ANDROID_BITMAP_RESULT_SUCCESS) return -3;
 
+    if (infoOrig.width != infoMask.width || infoOrig.height != infoMask.height ||
+        infoOrig.width != infoOut.width || infoOrig.height != infoOut.height) {
+        return -4;
+    }
+
     if (infoOrig.stride != infoOrig.width * 4 ||
         infoMask.stride != infoMask.width * 4 ||
         infoOut.stride != infoOut.width * 4) {
         return -6;
     }
 
-    AndroidBitmap_lockPixels(env, original, &pixelsOrig);
-    AndroidBitmap_lockPixels(env, mask, &pixelsMask);
-    AndroidBitmap_lockPixels(env, outBitmap, &pixelsOut);
+    if (AndroidBitmap_lockPixels(env, original, &pixelsOrig) != ANDROID_BITMAP_RESULT_SUCCESS) return -7;
+    if (AndroidBitmap_lockPixels(env, mask, &pixelsMask) != ANDROID_BITMAP_RESULT_SUCCESS) {
+        AndroidBitmap_unlockPixels(env, original);
+        return -8;
+    }
+    if (AndroidBitmap_lockPixels(env, outBitmap, &pixelsOut) != ANDROID_BITMAP_RESULT_SUCCESS) {
+        AndroidBitmap_unlockPixels(env, mask);
+        AndroidBitmap_unlockPixels(env, original);
+        return -9;
+    }
 
     cv::Mat srcMat(infoOrig.height, infoOrig.width, CV_8UC4, pixelsOrig);
     cv::Mat maskMat(infoMask.height, infoMask.width, CV_8UC4, pixelsMask);

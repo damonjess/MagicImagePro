@@ -10,6 +10,7 @@ import android.graphics.PorterDuff
 import android.graphics.PorterDuffXfermode
 import android.graphics.Rect
 import android.graphics.RectF
+import android.util.Log
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -26,6 +27,7 @@ class ObjectRemover(context: Context) : TFLiteModel(context, "lama_dilated-tflit
 
     private val modelWidth = 512
     private val modelHeight = 512
+    private val nativeProcessor = NativeProcessor()
 
     suspend fun removeObject(image: Bitmap, mask: Bitmap): Bitmap = withContext(Dispatchers.Default) {
         val w = image.width
@@ -34,14 +36,12 @@ class ObjectRemover(context: Context) : TFLiteModel(context, "lama_dilated-tflit
         val safeImage = image.copy(image.config ?: Bitmap.Config.ARGB_8888, true)
         val safeMask = mask.copy(Bitmap.Config.ARGB_8888, true)
 
-        val (dilatedImage, dilatedMask) = dilateMaskForCoverage(safeImage, safeMask)
-        safeImage.recycle()
+        val dilatedMask = dilateMaskOnly(safeMask)
         safeMask.recycle()
 
         val maskPx = IntArray(w * h)
         dilatedMask.getPixels(maskPx, 0, w, 0, 0, w, h)
 
-        val dist = bfsDistanceToUnmasked(maskPx, w, h)
         val roi = computeMaskRoi(maskPx, w, h, contextPadFrac = 0.55f)
 
         val roiW = roi.right - roi.left
@@ -51,7 +51,7 @@ class ObjectRemover(context: Context) : TFLiteModel(context, "lama_dilated-tflit
         val useRoi = roiArea < fullArea * 0.25f && roiW > 0 && roiH > 0
 
         val aiInpainted: Bitmap = if (useRoi) {
-            val cropImg = Bitmap.createBitmap(dilatedImage, roi.left, roi.top, roiW, roiH)
+            val cropImg = Bitmap.createBitmap(safeImage, roi.left, roi.top, roiW, roiH)
             val cropMask = Bitmap.createBitmap(dilatedMask, roi.left, roi.top, roiW, roiH)
             val inpaintedCrop = runLaMaOnBitmap(cropImg, cropMask)
             cropImg.recycle()
@@ -59,37 +59,39 @@ class ObjectRemover(context: Context) : TFLiteModel(context, "lama_dilated-tflit
 
             val fullResult = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
             val c = Canvas(fullResult)
-            c.drawBitmap(dilatedImage, 0f, 0f, null)
+            c.drawBitmap(safeImage, 0f, 0f, null)
             c.drawBitmap(inpaintedCrop, roi.left.toFloat(), roi.top.toFloat(), null)
             inpaintedCrop.recycle()
             fullResult
         } else {
-            runLaMaOnBitmap(dilatedImage, dilatedMask)
+            runLaMaOnBitmap(safeImage, dilatedMask)
         }
 
-        val colorCorrected = matchBorderColors(dilatedImage, aiInpainted, maskPx, dist, w, h)
-        aiInpainted.recycle()
+        val rawInpainted: Bitmap = if (isMostlyWhite(aiInpainted)) {
+            Log.w("LaMa", "AI output is mostly white; using native fallback")
+            aiInpainted.recycle()
+            val fallback = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            val status = nativeProcessor.processImage(safeImage, dilatedMask, fallback)
+            if (status != 0) {
+                fallback.recycle()
+                safeImage.recycle()
+                dilatedMask.recycle()
+                throw IllegalStateException("Native inpainting failed with status $status")
+            }
+            fallback
+        } else {
+            aiInpainted
+        }
 
-        val maxDim = max(w, h).toFloat()
-        val adaptiveBlur = (maxDim / 110f).coerceIn(10f, 42f)
-        val widerBlur = (adaptiveBlur * 2.2f).coerceAtMost(65f)
+        val alphaMask = blurMask(dilatedMask, 12f)
+        val finalResult = seamlessComposite(safeImage, rawInpainted, alphaMask)
 
-        val softMaskOuter = blurMask(dilatedMask, blurRadius = widerBlur)
-        val softMaskInner = blurMask(dilatedMask, blurRadius = adaptiveBlur * 0.45f)
-        val gradientMask = buildGradientTransitionMask(softMaskOuter, softMaskInner)
-
-        val seamless = seamlessComposite(dilatedImage, colorCorrected, gradientMask)
-        colorCorrected.recycle()
-        softMaskOuter.recycle()
-        softMaskInner.recycle()
-        gradientMask.recycle()
-
-        val final = cleanupSeamLine(seamless, maskPx, dist, adaptiveBlur, w, h)
-        seamless.recycle()
-        dilatedImage.recycle()
+        rawInpainted.recycle()
+        alphaMask.recycle()
+        safeImage.recycle()
         dilatedMask.recycle()
 
-        final
+        finalResult
     }
 
     // ---------------------------------------------------------------------
@@ -168,7 +170,7 @@ class ObjectRemover(context: Context) : TFLiteModel(context, "lama_dilated-tflit
         val imageIsNchw = imageShape.size == 4 && imageShape[1] == 3
         val maskIsNchw = maskShape.size == 4 && maskShape[1] == 1
 
-        fillImageBuffer(scaledImg, imgBuf, imageIsNchw)
+        fillImageBuffer(scaledImg, scaledMask, imgBuf, imageIsNchw)
         fillMaskBuffer(scaledMask, maskBuf, maskIsNchw)
         scaledImg.recycle()
         scaledMask.recycle()
@@ -182,6 +184,11 @@ class ObjectRemover(context: Context) : TFLiteModel(context, "lama_dilated-tflit
         )
 
         val outputShape = interpreter.getOutputTensor(0).shape()
+        Log.d("LaMa", "output shape = ${outputShape.contentToString()}")
+        val sample = FloatArray(12)
+        outputBuf.rewind()
+        outputBuf.asFloatBuffer().get(sample)
+        Log.d("LaMa", "first 12 floats = ${sample.contentToString()}")
         val isNchwOutput = outputShape != null && outputShape.size == 4 && outputShape[1] == 3
 
         val rawSquare = convertOutputToBitmap(outputBuf, modelWidth, modelHeight, isNchwOutput)
@@ -206,31 +213,51 @@ class ObjectRemover(context: Context) : TFLiteModel(context, "lama_dilated-tflit
         return resized
     }
 
-    private fun fillImageBuffer(img: Bitmap, imgBuf: ByteBuffer, isNchw: Boolean) {
+    private fun isMostlyWhite(bmp: Bitmap, threshold: Int = 240): Boolean {
+        val bw = bmp.width
+        val bh = bmp.height
+        val pixels = IntArray(bw * bh)
+        bmp.getPixels(pixels, 0, bw, 0, 0, bw, bh)
+        var white = 0
+        var sampled = 0
+        for (i in pixels.indices step 16) {
+            sampled++
+            val p = pixels[i]
+            if (Color.red(p) > threshold && Color.green(p) > threshold && Color.blue(p) > threshold) white++
+        }
+        return sampled > 0 && white.toFloat() / sampled > 0.85f
+    }
+
+    private fun fillImageBuffer(img: Bitmap, mask: Bitmap, imgBuf: ByteBuffer, isNchw: Boolean) {
         val w = img.width
         val h = img.height
         val total = w * h
         val iPx = IntArray(total)
+        val mPx = IntArray(total)
         img.getPixels(iPx, 0, w, 0, 0, w, h)
+        mask.getPixels(mPx, 0, w, 0, 0, w, h)
         imgBuf.rewind()
 
         if (isNchw) {
             for (i in 0 until total) {
-                imgBuf.putFloat(Color.red(iPx[i]) / 255f)
+                val isMasked = isMaskPixel(mPx[i])
+                imgBuf.putFloat(if (isMasked) 0f else Color.red(iPx[i]) / 255f)
             }
             for (i in 0 until total) {
-                imgBuf.putFloat(Color.green(iPx[i]) / 255f)
+                val isMasked = isMaskPixel(mPx[i])
+                imgBuf.putFloat(if (isMasked) 0f else Color.green(iPx[i]) / 255f)
             }
             for (i in 0 until total) {
-                imgBuf.putFloat(Color.blue(iPx[i]) / 255f)
+                val isMasked = isMaskPixel(mPx[i])
+                imgBuf.putFloat(if (isMasked) 0f else Color.blue(iPx[i]) / 255f)
             }
         } else {
             for (i in 0 until total) {
+                val isMasked = isMaskPixel(mPx[i])
                 val c = iPx[i]
-                imgBuf.putFloat(Color.red(c) / 255f)
-                imgBuf.putFloat(Color.green(c) / 255f)
-                imgBuf.putFloat(Color.blue(c) / 255f)
-
+                imgBuf.putFloat(if (isMasked) 0f else Color.red(c) / 255f)
+                imgBuf.putFloat(if (isMasked) 0f else Color.green(c) / 255f)
+                imgBuf.putFloat(if (isMasked) 0f else Color.blue(c) / 255f)
             }
         }
     }
@@ -253,21 +280,48 @@ class ObjectRemover(context: Context) : TFLiteModel(context, "lama_dilated-tflit
         val total = w * h
         val out = IntArray(total)
 
+        val floatBuf = buf.asFloatBuffer()
+        val floats = FloatArray(floatBuf.remaining())
+        floatBuf.get(floats)
+
+        var minVal = Float.MAX_VALUE
+        var maxVal = -Float.MAX_VALUE
+        val checkStep = maxOf(1, floats.size / 1000)
+        for (i in floats.indices step checkStep) {
+            val v = floats[i]
+            if (v < minVal) minVal = v
+            if (v > maxVal) maxVal = v
+        }
+
+        val mode = when {
+            maxVal > 2.0f -> 0 // In [0, 255]
+            minVal < -0.1f -> 1 // In [-1, 1]
+            else -> 2 // In [0, 1]
+        }
+
+        fun toByte(v: Float): Int {
+            return when (mode) {
+                0 -> v.coerceIn(0f, 255f).toInt()
+                1 -> ((v + 1f) * 127.5f).coerceIn(0f, 255f).toInt()
+                else -> (v * 255f).coerceIn(0f, 255f).toInt()
+            }
+        }
+
         if (isNchw) {
             val rOffset = 0
-            val gOffset = total * 4
-            val bOffset = total * 8
+            val gOffset = total
+            val bOffset = total * 2
             for (i in 0 until total) {
-                val r = (buf.getFloat(rOffset + i * 4) * 255f).coerceIn(0f, 255f).toInt()
-                val g = (buf.getFloat(gOffset + i * 4) * 255f).coerceIn(0f, 255f).toInt()
-                val b = (buf.getFloat(bOffset + i * 4) * 255f).coerceIn(0f, 255f).toInt()
+                val r = toByte(floats[rOffset + i])
+                val g = toByte(floats[gOffset + i])
+                val b = toByte(floats[bOffset + i])
                 out[i] = Color.rgb(r, g, b)
             }
         } else {
             for (i in 0 until total) {
-                val r = (buf.float * 255f).coerceIn(0f, 255f).toInt()
-                val g = (buf.float * 255f).coerceIn(0f, 255f).toInt()
-                val b = (buf.float * 255f).coerceIn(0f, 255f).toInt()
+                val r = toByte(floats[i * 3])
+                val g = toByte(floats[i * 3 + 1])
+                val b = toByte(floats[i * 3 + 2])
                 out[i] = Color.rgb(r, g, b)
             }
         }
@@ -348,9 +402,9 @@ class ObjectRemover(context: Context) : TFLiteModel(context, "lama_dilated-tflit
     // Mask dilation for coverage (fast block-dilate, limited rounds)
     // ---------------------------------------------------------------------
 
-    private fun dilateMaskForCoverage(image: Bitmap, mask: Bitmap): Pair<Bitmap, Bitmap> {
-        val w = image.width
-        val h = image.height
+    private fun dilateMaskOnly(mask: Bitmap): Bitmap {
+        val w = mask.width
+        val h = mask.height
         val maxDim = max(w, h)
         val rounds = when {
             maxDim <= 800 -> 2
@@ -383,50 +437,7 @@ class ObjectRemover(context: Context) : TFLiteModel(context, "lama_dilated-tflit
         val dilMaskPx = IntArray(w * h)
         workMask.getPixels(dilMaskPx, 0, w, 0, 0, w, h)
 
-        val median = medianBorderColorFast(image, dilMaskPx, w, h)
-        val origPx = IntArray(w * h)
-        image.getPixels(origPx, 0, w, 0, 0, w, h)
-        val filledPx = IntArray(w * h)
-        for (i in 0 until w * h) {
-            filledPx[i] = if (isMaskPixel(dilMaskPx[i])) median else origPx[i]
-        }
-        val outImg = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        outImg.setPixels(filledPx, 0, w, 0, 0, w, h)
-
-        return outImg to workMask
-    }
-
-    private fun medianBorderColorFast(image: Bitmap, maskPx: IntArray, w: Int, h: Int): Int {
-        val orig = IntArray(w * h)
-        image.getPixels(orig, 0, w, 0, 0, w, h)
-        val rs = IntArray(4096)
-        val gs = IntArray(4096)
-        val bs = IntArray(4096)
-        var n = 0
-        for (y in 0 until h step 2) {
-            val row = y * w
-            for (x in 0 until w step 2) {
-                val idx = row + x
-                if (!isMaskPixel(maskPx[idx])) {
-                    var adj = false
-                    if (x > 0 && isMaskPixel(maskPx[idx - 1])) adj = true
-                    else if (x < w - 1 && isMaskPixel(maskPx[idx + 1])) adj = true
-                    else if (y > 0 && isMaskPixel(maskPx[idx - w])) adj = true
-                    else if (y < h - 1 && isMaskPixel(maskPx[idx + w])) adj = true
-                    if (adj && n < 4096) {
-                        val c = orig[idx]
-                        rs[n] = Color.red(c)
-                        gs[n] = Color.green(c)
-                        bs[n] = Color.blue(c)
-                        n++
-                    }
-                }
-            }
-        }
-        if (n == 0) return Color.rgb(128, 128, 128)
-        rs.sort(0, n); gs.sort(0, n); bs.sort(0, n)
-        val m = n / 2
-        return Color.rgb(rs[m], gs[m], bs[m])
+        return workMask
     }
 
     // ---------------------------------------------------------------------

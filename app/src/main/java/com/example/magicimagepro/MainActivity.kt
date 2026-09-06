@@ -134,7 +134,11 @@ class MainActivity : AppCompatActivity() {
                         remover.removeObject(image, mask)
                     } else {
                         val fallback = Bitmap.createBitmap(image.width, image.height, Bitmap.Config.ARGB_8888)
-                        nativeProcessor.processImage(image, mask, fallback)
+                        val status = nativeProcessor.processImage(image, mask, fallback)
+                        if (status != 0) {
+                            fallback.recycle()
+                            error("Native inpainting failed with status $status")
+                        }
                         fallback
                     }
                     if (mask != rawMask) {
