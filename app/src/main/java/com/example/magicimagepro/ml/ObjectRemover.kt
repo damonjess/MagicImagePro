@@ -83,7 +83,7 @@ class ObjectRemover(context: Context) : TFLiteModel(context, "lama_dilated-tflit
             aiInpainted
         }
 
-        val alphaMask = blurMask(dilatedMask, 12f)
+        val alphaMask = buildCompositeAlphaMask(dilatedMask, 12f)
         val finalResult = seamlessComposite(safeImage, rawInpainted, alphaMask)
 
         rawInpainted.recycle()
@@ -569,15 +569,52 @@ class ObjectRemover(context: Context) : TFLiteModel(context, "lama_dilated-tflit
     // Mask blur + gradient transition
     // ---------------------------------------------------------------------
 
-    private fun blurMask(mask: Bitmap, blurRadius: Float): Bitmap {
-        val w = mask.width; val h = mask.height
+    private fun buildCompositeAlphaMask(mask: Bitmap, blurRadius: Float): Bitmap {
+        val w = mask.width
+        val h = mask.height
+        val total = w * h
+
+        val srcPixels = IntArray(total)
+        mask.getPixels(srcPixels, 0, w, 0, 0, w, h)
+
+        val alphaPixels = IntArray(total)
+        val isMasked = BooleanArray(total)
+        for (i in 0 until total) {
+            val masked = isMaskPixel(srcPixels[i])
+            isMasked[i] = masked
+            alphaPixels[i] = if (masked) Color.WHITE else Color.TRANSPARENT
+        }
+
+        val binaryAlphaBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        binaryAlphaBmp.setPixels(alphaPixels, 0, w, 0, 0, w, h)
+
         val radius = blurRadius.coerceAtLeast(1f)
-        val result = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        val c = Canvas(result)
-        val p = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        val blurredBmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(blurredBmp)
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
             maskFilter = BlurMaskFilter(radius, BlurMaskFilter.Blur.NORMAL)
         }
-        c.drawBitmap(mask, 0f, 0f, p)
+        canvas.drawBitmap(binaryAlphaBmp, 0f, 0f, paint)
+        binaryAlphaBmp.recycle()
+
+        val blurredPixels = IntArray(total)
+        blurredBmp.getPixels(blurredPixels, 0, w, 0, 0, w, h)
+
+        for (i in 0 until total) {
+            if (isMasked[i]) {
+                // Interior of selection stays 100% opaque (alpha = 255)
+                blurredPixels[i] = Color.WHITE
+            } else {
+                // Feathered outward edge: keep alpha from blur
+                val a = Color.alpha(blurredPixels[i])
+                blurredPixels[i] = Color.argb(a, 255, 255, 255)
+            }
+        }
+
+        val result = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        result.setPixels(blurredPixels, 0, w, 0, 0, w, h)
+        blurredBmp.recycle()
+
         return result
     }
 
@@ -614,10 +651,10 @@ class ObjectRemover(context: Context) : TFLiteModel(context, "lama_dilated-tflit
         val maskedInpaint = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         val ci = Canvas(maskedInpaint)
         ci.drawBitmap(inpainted, 0f, 0f, null)
-        val srcIn = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-            xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC_IN)
+        val dstIn = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_IN)
         }
-        ci.drawBitmap(alphaMask, 0f, 0f, srcIn)
+        ci.drawBitmap(alphaMask, 0f, 0f, dstIn)
         c.drawBitmap(maskedInpaint, 0f, 0f, null)
         maskedInpaint.recycle()
         return out
