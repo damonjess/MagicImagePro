@@ -10,4 +10,5 @@ class NativeProcessor {
     }
 
     external fun processImage(original: Bitmap, mask: Bitmap, outBitmap: Bitmap): Int
+    external fun seamlessComposite(original: Bitmap, inpainted: Bitmap, mask: Bitmap, outBitmap: Bitmap): Int
 }

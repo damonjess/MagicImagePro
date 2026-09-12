@@ -83,15 +83,24 @@ class ObjectRemover(context: Context) : TFLiteModel(context, "lama_dilated-tflit
             aiInpainted
         }
 
-        val alphaMask = buildCompositeAlphaMask(dilatedMask, 12f)
-        val finalResult = seamlessComposite(safeImage, rawInpainted, alphaMask)
+        val finalResult = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val status = nativeProcessor.seamlessComposite(safeImage, rawInpainted, dilatedMask, finalResult)
+        val resultBitmap = if (status == 0) {
+            finalResult
+        } else {
+            Log.w("ObjectRemover", "Native seamlessComposite failed ($status); using alpha blend fallback")
+            finalResult.recycle()
+            val alphaMask = buildCompositeAlphaMask(dilatedMask, 12f)
+            val fallback = legacySeamlessComposite(safeImage, rawInpainted, alphaMask)
+            alphaMask.recycle()
+            fallback
+        }
 
         rawInpainted.recycle()
-        alphaMask.recycle()
         safeImage.recycle()
         dilatedMask.recycle()
 
-        finalResult
+        resultBitmap
     }
 
     // ---------------------------------------------------------------------
@@ -640,7 +649,7 @@ class ObjectRemover(context: Context) : TFLiteModel(context, "lama_dilated-tflit
     // Seamless composite (SRC_IN for alpha-masked inpaint, then SRC_OVER)
     // ---------------------------------------------------------------------
 
-    private fun seamlessComposite(
+    private fun legacySeamlessComposite(
         original: Bitmap, inpainted: Bitmap, alphaMask: Bitmap
     ): Bitmap {
         val w = original.width; val h = original.height
