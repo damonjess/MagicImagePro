@@ -6,6 +6,7 @@ import android.util.AttributeSet
 import android.view.MotionEvent
 import android.view.View
 import androidx.core.view.doOnLayout
+import kotlin.math.hypot
 
 enum class ToolMode { BRUSH, LASSO, ERASER }
 
@@ -23,6 +24,13 @@ class MaskDrawingView @JvmOverloads constructor(
         fun onTap(x: Float, y: Float)
     }
     var onTapListener: OnTapListener? = null
+
+    /**
+     * Notifies the host whenever the photo/mask view transform changes (pinch
+     * zoom & pan), so sibling views showing the same photo can follow along.
+     * Args: zoom, panX, panY where screen = pan + zoom * fitPoint.
+     */
+    var onTransformListener: ((zoom: Float, panX: Float, panY: Float) -> Unit)? = null
 
     private var imageBitmap: Bitmap? = null
     private var baseMaskBitmap: Bitmap? = null
@@ -81,9 +89,29 @@ class MaskDrawingView @JvmOverloads constructor(
     private var offsetY = 0f
     private val displayRect = RectF()
 
+    // View-level zoom/pan applied on top of the fit-center rect. Two fingers
+    // pinch-zoom and pan; one finger draws. screen = pan + zoom * fitPoint.
+    private var viewZoom = 1f
+    private var viewPanX = 0f
+    private var viewPanY = 0f
+    private var isPinching = false
+    private var pinchStartSpan = 1f
+    private var pinchStartZoom = 1f
+    private var pinchStartPanX = 0f
+    private var pinchStartPanY = 0f
+    private var pinchStartFocalX = 0f
+    private var pinchStartFocalY = 0f
+
     fun setImage(bitmap: Bitmap) {
         imageBitmap = bitmap
         
+        // A new photo always starts unzoomed.
+        viewZoom = 1f
+        viewPanX = 0f
+        viewPanY = 0f
+        isPinching = false
+        notifyTransform()
+
         baseMaskBitmap?.recycle()
         baseMaskBitmap = null
 
@@ -108,8 +136,43 @@ class MaskDrawingView @JvmOverloads constructor(
             offsetX = (width - scaledW) / 2f
             offsetY = (height - scaledH) / 2f
             displayRect.set(offsetX, offsetY, offsetX + scaledW, offsetY + scaledH)
+            clampPan()
+            notifyTransform()
         }
     }
+
+    private fun notifyTransform() {
+        onTransformListener?.invoke(viewZoom, viewPanX, viewPanY)
+    }
+
+    /** Keeps the zoomed image from being dragged completely off the view. */
+    private fun clampPan() {
+        val bmp = imageBitmap ?: return
+        if (viewZoom <= 1f) {
+            viewZoom = 1f
+            viewPanX = 0f
+            viewPanY = 0f
+            return
+        }
+        // Content spans [pan + zoom*offset .. pan + zoom*(offset+size)] per axis.
+        val leftEdge = viewPanX + viewZoom * offsetX
+        val rightEdge = viewPanX + viewZoom * (offsetX + bmp.width * scaleFactor)
+        val topEdge = viewPanY + viewZoom * offsetY
+        val bottomEdge = viewPanY + viewZoom * (offsetY + bmp.height * scaleFactor)
+        if (rightEdge < 0f) viewPanX -= rightEdge
+        if (leftEdge > width) viewPanX -= (leftEdge - width)
+        if (bottomEdge < 0f) viewPanY -= bottomEdge
+        if (topEdge > height) viewPanY -= (topEdge - height)
+    }
+
+    private fun pinchSpan(e: MotionEvent): Float {
+        val dx = e.getX(0) - e.getX(1)
+        val dy = e.getY(0) - e.getY(1)
+        return hypot(dx, dy).coerceAtLeast(1f)
+    }
+
+    private fun pinchFocal(e: MotionEvent): Pair<Float, Float> =
+        Pair((e.getX(0) + e.getX(1)) / 2f, (e.getY(0) + e.getY(1)) / 2f)
 
     fun setMask(mask: Bitmap) {
         val bmp = imageBitmap ?: return
@@ -259,6 +322,9 @@ class MaskDrawingView @JvmOverloads constructor(
         // 1. Draw Main Canvas
         displayMaskBitmap?.let {
             canvas.save()
+            // View-level pinch zoom/pan, then the fit-center mapping.
+            canvas.translate(viewPanX, viewPanY)
+            canvas.scale(viewZoom, viewZoom)
             canvas.translate(offsetX, offsetY)
             canvas.scale(scaleFactor, scaleFactor)
             canvas.drawBitmap(it, 0f, 0f, null)
@@ -275,14 +341,14 @@ class MaskDrawingView @JvmOverloads constructor(
             canvas.restore()
         }
         
-        // 2. Draw Cursor Hollow Circle (Main View)
-        if (isDrawing || touchX != -1f) {
-            val displayBrushRadius = (brushSize * scaleFactor) / 2f
+        // 2. Draw Cursor Hollow Circle (Main View) - hidden while pinching
+        if (!isPinching && (isDrawing || touchX != -1f)) {
+            val displayBrushRadius = (brushSize * scaleFactor * viewZoom) / 2f
             canvas.drawCircle(cursorX, cursorY, displayBrushRadius, cursorPaint)
         }
 
-        // 3. Draw Smart Loupe (Magnifier)
-        if (isDrawing || touchX != -1f) {
+        // 3. Draw Smart Loupe (Magnifier) - hidden while pinching
+        if (!isPinching && (isDrawing || touchX != -1f)) {
             val loupeRadius = 180f
             val margin = 60f
             
@@ -309,6 +375,8 @@ class MaskDrawingView @JvmOverloads constructor(
             // Redraw the photo & masks inside the loupe
             imageBitmap?.let {
                 canvas.save()
+                canvas.translate(viewPanX, viewPanY)
+                canvas.scale(viewZoom, viewZoom)
                 canvas.translate(offsetX, offsetY)
                 canvas.scale(scaleFactor, scaleFactor)
                 canvas.drawBitmap(it, 0f, 0f, null)
@@ -334,7 +402,7 @@ class MaskDrawingView @JvmOverloads constructor(
             canvas.drawLine(cursorX, cursorY - crosshairLen, cursorX, cursorY + crosshairLen, crosshairPaint)
             
             // Draw Cursor Hollow Circle (Loupe View)
-            val displayBrushRadius = (brushSize * scaleFactor) / 2f
+            val displayBrushRadius = (brushSize * scaleFactor * viewZoom) / 2f
             val loupeCursorPaint = Paint(cursorPaint).apply { strokeWidth = 5f / zoom }
             canvas.drawCircle(cursorX, cursorY, displayBrushRadius, loupeCursorPaint)
 
@@ -346,49 +414,86 @@ class MaskDrawingView @JvmOverloads constructor(
     }
     
     private fun mapToImage(x: Float, y: Float): Pair<Float, Float>? {
-        if (!displayRect.contains(x, y)) return null
-        return Pair((x - offsetX) / scaleFactor, (y - offsetY) / scaleFactor)
+        // Undo the view-level zoom/pan first, then the fit-center mapping.
+        val fitX = (x - viewPanX) / viewZoom
+        val fitY = (y - viewPanY) / viewZoom
+        if (!displayRect.contains(fitX, fitY)) return null
+        return Pair((fitX - offsetX) / scaleFactor, (fitY - offsetY) / scaleFactor)
     }
     
     override fun onTouchEvent(event: MotionEvent): Boolean {
-        touchX = event.x
-        touchY = event.y
-        
-        // Apply Offset!
-        val drawY = event.y - cursorOffset
-        val mapped = mapToImage(event.x, drawY)
-        
-        if (editMode == EditMode.SMART_SELECT) {
-            if (event.action == MotionEvent.ACTION_UP) {
-                val upMapped = mapToImage(event.x, event.y) // Tap is where finger is, not offset
-                if (upMapped != null) {
-                    onTapListener?.onTap(upMapped.first, upMapped.second)
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                touchX = event.x
+                touchY = event.y
+                isPinching = false
+                // Apply Offset!
+                val drawY = event.y - cursorOffset
+                val mapped = mapToImage(event.x, drawY)
+                if (mapped != null) {
+                    isDrawing = true
+                    currentPath = Path()
+                    currentPath.moveTo(mapped.first, mapped.second)
+                    currentPath.lineTo(mapped.first, mapped.second)
+                    redoStack.clear()
                 }
             }
-            invalidate()
-            return true
-        }
-
-        if (mapped == null && event.action != MotionEvent.ACTION_UP) {
-            invalidate(); return true 
-        }
-        
-        val mx = mapped?.first ?: 0f
-        val my = mapped?.second ?: 0f
-        
-        when (event.action) {
-            MotionEvent.ACTION_DOWN -> {
-                isDrawing = true
-                currentPath = Path()
-                currentPath.moveTo(mx, my)
-                currentPath.lineTo(mx, my)
-                redoStack.clear()
+            MotionEvent.ACTION_POINTER_DOWN -> {
+                if (event.pointerCount >= 2) {
+                    // Two fingers: abandon any in-progress stroke and switch to
+                    // zoom/pan until every extra finger is lifted.
+                    if (isDrawing) {
+                        isDrawing = false
+                        currentPath = Path()
+                    }
+                    isPinching = true
+                    touchX = -1f
+                    pinchStartSpan = pinchSpan(event)
+                    pinchStartZoom = viewZoom
+                    pinchStartPanX = viewPanX
+                    pinchStartPanY = viewPanY
+                    val focal = pinchFocal(event)
+                    pinchStartFocalX = focal.first
+                    pinchStartFocalY = focal.second
+                }
             }
             MotionEvent.ACTION_MOVE -> {
-                if (isDrawing) currentPath.lineTo(mx, my)
+                if (isPinching && event.pointerCount >= 2) {
+                    val span = pinchSpan(event)
+                    val focal = pinchFocal(event)
+                    val newZoom = (pinchStartZoom * span / pinchStartSpan).coerceIn(1f, 8f)
+                    // Fit-space point that was under the starting focal stays
+                    // under the current focal while zooming and panning.
+                    val fitX = (pinchStartFocalX - pinchStartPanX) / pinchStartZoom
+                    val fitY = (pinchStartFocalY - pinchStartPanY) / pinchStartZoom
+                    viewZoom = newZoom
+                    viewPanX = focal.first - newZoom * fitX
+                    viewPanY = focal.second - newZoom * fitY
+                    clampPan()
+                    notifyTransform()
+                } else if (!isPinching) {
+                    touchX = event.x
+                    touchY = event.y
+                    val drawY = event.y - cursorOffset
+                    val mapped = mapToImage(event.x, drawY)
+                    if (isDrawing && mapped != null) {
+                        currentPath.lineTo(mapped.first, mapped.second)
+                    }
+                }
+            }
+            MotionEvent.ACTION_POINTER_UP -> {
+                if (isPinching && event.pointerCount - 1 <= 1) {
+                    // Back to one finger: stay in "no drawing" state until the
+                    // next fresh touch so the stroke doesn't jump.
+                    isPinching = false
+                    isDrawing = false
+                    touchX = -1f
+                }
             }
             MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
-                if (isDrawing) {
+                if (isPinching) {
+                    isPinching = false
+                } else if (isDrawing) {
                     if (currentMode == ToolMode.LASSO) currentPath.close()
                     // Save to history
                     actionStack.add(DrawAction(Path(currentPath), currentMode, brushSize))

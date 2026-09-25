@@ -4,12 +4,14 @@ import android.content.ContentValues
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Color
+import android.graphics.Matrix
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.provider.MediaStore
 import android.view.View
+import android.widget.ImageView
 import android.widget.Toast
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
@@ -18,6 +20,7 @@ import androidx.core.graphics.scale
 import androidx.core.graphics.createBitmap
 import androidx.core.graphics.toColorInt
 import androidx.core.view.ViewCompat
+import androidx.core.view.doOnLayout
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.updatePadding
 import androidx.lifecycle.lifecycleScope
@@ -93,6 +96,14 @@ class MainActivity : AppCompatActivity() {
     }
     
     private fun setupUI() {
+        // The mask view owns the pinch-zoom/pan transform; the photo view must
+        // show the exact same region, so it is driven by a matrix that mirrors
+        // the mask view's transform on top of its own fit-center mapping.
+        binding.imageView.scaleType = ImageView.ScaleType.MATRIX
+        binding.maskView.onTransformListener = { zoom, panX, panY ->
+            applyPhotoTransform(zoom, panX, panY)
+        }
+
         // New Camera Button
         binding.btnCamera.setOnClickListener { cameraPicker.launch(null) }
         
@@ -213,6 +224,30 @@ class MainActivity : AppCompatActivity() {
         }
     }
     
+    /**
+     * Reproduces the mask view's current zoom/pan on the photo view so brush
+     * and photo never drift apart: screen = pan + zoom * fitCenter(bitmap).
+     */
+    private fun applyPhotoTransform(zoom: Float, panX: Float, panY: Float) {
+        val bmp = currentBitmap ?: return
+        val v = binding.imageView
+        if (v.width == 0 || v.height == 0) {
+            v.doOnLayout { applyPhotoTransform(zoom, panX, panY) }
+            return
+        }
+        val s = minOf(v.width.toFloat() / bmp.width, v.height.toFloat() / bmp.height)
+        val fit = Matrix().apply {
+            setTranslate((v.width - bmp.width * s) / 2f, (v.height - bmp.height * s) / 2f)
+            preScale(s, s)
+        }
+        val m = Matrix().apply {
+            setTranslate(panX, panY)
+            preScale(zoom, zoom)
+            preConcat(fit)
+        }
+        v.imageMatrix = m
+    }
+
     private fun showEngineBadge(label: String) {
         binding.engineBadge.text = label
         binding.engineBadge.visibility = View.VISIBLE

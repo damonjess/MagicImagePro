@@ -13,8 +13,8 @@ android {
         applicationId = "com.example.magicimagepro"
         minSdk = 26
         targetSdk = 35
-        versionCode = 5
-        versionName = "1.4-clean-texture"
+        versionCode = 6
+        versionName = "1.5-pinch-zoom"
         
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
