@@ -43,8 +43,9 @@ class MainActivity : AppCompatActivity() {
     private var objectRemover: ObjectRemover? = null
     private var objectRemoverDeferred: Deferred<ObjectRemover?>? = null
     private var objectRemoverError: String? = null
-    @Suppress("unused")
     private var objectSnapper: ObjectSnapper? = null
+    private var objectSnapperDeferred: Deferred<ObjectSnapper?>? = null
+    private var objectSnapperError: String? = null
     @Suppress("unused")
     private var imageUpscaler: ImageUpscaler? = null
     @Suppress("unused")
@@ -85,6 +86,16 @@ class MainActivity : AppCompatActivity() {
                     // Never swallow engine-load failures: they are reported to the
                     // user when REMOVE OBJECT is pressed (see btnProcess).
                     objectRemoverError = e.message ?: e::class.simpleName
+                    e.printStackTrace()
+                    null
+                }
+            }
+            objectSnapperDeferred = lifecycleScope.async(Dispatchers.Default) {
+                try {
+                    ObjectSnapper(this@MainActivity).also { objectSnapper = it }
+                } catch (e: Exception) {
+                    // Reported when SNAP is pressed; drawing keeps working.
+                    objectSnapperError = e.message ?: e::class.simpleName
                     e.printStackTrace()
                     null
                 }
@@ -131,6 +142,53 @@ class MainActivity : AppCompatActivity() {
         binding.btnBrush.setOnClickListener { setTool(ToolMode.BRUSH) }
         binding.btnLasso.setOnClickListener { setTool(ToolMode.LASSO) }
         binding.btnEraser.setOnClickListener { setTool(ToolMode.ERASER) }
+        
+        binding.btnSnap.setOnClickListener {
+            val image = currentBitmap ?: run {
+                Toast.makeText(this, "Please select or take a photo first", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            val rawMask = binding.maskView.getMaskBitmap()
+            if (rawMask == null || isMaskEmpty(rawMask)) {
+                Toast.makeText(this, "Draw around the object first, then tap Snap", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+
+            binding.progressBar.visibility = View.VISIBLE
+            lifecycleScope.launch(Dispatchers.Default) {
+                val result = runCatching {
+                    val snapper = objectSnapperDeferred?.await()
+                    if (snapper == null) {
+                        withContext(Dispatchers.Main) {
+                            Toast.makeText(
+                                this@MainActivity,
+                                "Snap unavailable (${objectSnapperError ?: "not loaded yet"})",
+                                Toast.LENGTH_LONG,
+                            ).show()
+                        }
+                        null
+                    } else {
+                        snapper.snap(image, rawMask)
+                    }
+                }.getOrElse { e ->
+                    e.printStackTrace()
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(this@MainActivity, "Snap failed: ${e.localizedMessage}", Toast.LENGTH_LONG).show()
+                    }
+                    null
+                }
+
+                withContext(Dispatchers.Main) {
+                    binding.progressBar.visibility = View.GONE
+                    if (result != null) {
+                        // The snapped mask becomes the base; further strokes are
+                        // relative to it, and undo returns to the drawn stroke.
+                        binding.maskView.setMask(result)
+                        Toast.makeText(this@MainActivity, "Snapped to object ✨", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            }
+        }
         
         binding.btnProcess.setOnClickListener {
             val image = currentBitmap ?: run {
@@ -363,7 +421,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        // Free the native C++ memory held by TensorFlow Lite
+        // Free the native ML sessions (ONNX Runtime + TFLite).
         objectRemover?.close()
         objectSnapper?.close()
         imageUpscaler?.close()
