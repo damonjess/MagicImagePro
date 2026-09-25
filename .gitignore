@@ -27,3 +27,11 @@
 *.bin
 *.apk
 *.aab
+
+# Large ML model files
+*.onnx
+*.tflite
+*.pb
+*.h5
+*.model
+
