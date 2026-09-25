@@ -10,162 +10,61 @@
 #define LOG_TAG "NativeProcessor"
 #define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
 
-static inline void featheredBlend(const cv::Mat& src, const cv::Mat& inpainted,
-                                   const cv::Mat& dilatedMask, cv::Mat& dst,
-                                   int featherPx) {
-    cv::Mat blurredMask;
-    cv::Mat element = cv::getStructuringElement(cv::MORPH_ELLIPSE,
-        cv::Size(std::max(3, featherPx * 2 + 1), std::max(3, featherPx * 2 + 1)));
-    cv::dilate(dilatedMask, blurredMask, element);
-    cv::GaussianBlur(blurredMask, blurredMask,
-        cv::Size(std::max(3, featherPx * 4 + 1) | 1, std::max(3, featherPx * 4 + 1) | 1), 0.0);
-
-    cv::Mat maskF, maskInv;
-    blurredMask.convertTo(maskF, CV_32F, 1.0 / 255.0);
-    maskInv = cv::Scalar(1.0f) - maskF;
-
-    std::vector<cv::Mat> srcCh, inCh, outCh;
-    cv::split(src, srcCh);
-    cv::split(inpainted, inCh);
-    outCh.resize(srcCh.size());
-
-    for (size_t c = 0; c < srcCh.size(); ++c) {
-        cv::Mat sF, iF;
-        srcCh[c].convertTo(sF, CV_32F);
-        inCh[c].convertTo(iF, CV_32F);
-        cv::Mat blended = sF.mul(maskInv) + iF.mul(maskF);
-        blended.convertTo(outCh[c], CV_8U);
-    }
-    cv::merge(outCh, dst);
-}
-
-static cv::Mat colorMatchBorder(const cv::Mat& srcRgb, const cv::Mat& inRgb, const cv::Mat& binMask) {
-    int maxDim = std::max(srcRgb.cols, srcRgb.rows);
-    int band = std::clamp(maxDim / 150, 4, 16);
-
-    cv::Mat element = cv::getStructuringElement(cv::MORPH_ELLIPSE, cv::Size(band * 2 + 1, band * 2 + 1));
-    cv::Mat dilatedMask, erodedMask;
-    cv::dilate(binMask, dilatedMask, element);
-    cv::erode(binMask, erodedMask, element);
-
-    cv::Mat outerBorder = dilatedMask & (~binMask);
-    cv::Mat innerBorder = binMask & (~erodedMask);
-
-    int outerCount = cv::countNonZero(outerBorder);
-    int innerCount = cv::countNonZero(innerBorder);
-
-    if (outerCount == 0 || innerCount == 0) {
-        return inRgb.clone();
+// ----------------------------------------------------------------------------
+// Seam composite
+//
+// Blends the inpainted result into the original with a tight edge-fade driven
+// by the mask's distance transform: at the hole rim we keep the original
+// pixels (perfect color/texture continuity), fading to the pure inpainted
+// content a few pixels deeper inside. Nothing outside the mask is ever
+// modified, and no global color statistics are applied.
+//
+// The previous pipeline (border color-gain + cv::seamlessClone Poisson
+// diffusion + a wide dilated feather) repeatedly smeared flat color over the
+// hole and bled surrounding colors into it, which is what produced the
+// blurry "the dog is still faintly there" look even when LaMa's output was
+// good. With a real generative fill underneath, the seam only needs a few
+// pixels of blending.
+// ----------------------------------------------------------------------------
+static cv::Mat seamlessCompositePipeline(const cv::Mat& srcRgb,
+                                          const cv::Mat& inRgb,
+                                          const cv::Mat& binMask) {
+    if (cv::countNonZero(binMask) == 0) {
+        return srcRgb.clone();
     }
 
-    cv::Scalar meanSrc = cv::mean(srcRgb, outerBorder);
-    cv::Scalar meanInp = cv::mean(inRgb, innerBorder);
-
-    cv::Scalar gain, offset;
-    bool useGain = true;
-
-    for (int c = 0; c < 3; ++c) {
-        offset[c] = meanSrc[c] - meanInp[c];
-        if (meanInp[c] > 1.0) {
-            gain[c] = meanSrc[c] / meanInp[c];
-        } else {
-            gain[c] = 1.0;
-        }
-        if (gain[c] < 0.6 || gain[c] > 1.4) {
-            useGain = false;
-        }
-    }
+    const int maxDim = std::max(srcRgb.cols, srcRgb.rows);
+    const int band = std::clamp(maxDim / 400, 3, 8);
+    const float bandF = static_cast<float>(band);
 
     cv::Mat distMap;
     cv::distanceTransform(binMask, distMap, cv::DIST_L2, 3);
 
-    const auto maxDist = static_cast<float>(band * 4);
-
-    cv::Mat matched = inRgb.clone();
-    for (int y = 0; y < inRgb.rows; ++y) {
-        const auto* inPtr = inRgb.ptr<cv::Vec3b>(y);
+    cv::Mat out = srcRgb.clone();
+    for (int y = 0; y < srcRgb.rows; ++y) {
         const uchar* mPtr = binMask.ptr<uchar>(y);
         const float* dPtr = distMap.ptr<float>(y);
-        cv::Vec3b* outPtr = matched.ptr<cv::Vec3b>(y);
+        const cv::Vec3b* sPtr = srcRgb.ptr<cv::Vec3b>(y);
+        const cv::Vec3b* iPtr = inRgb.ptr<cv::Vec3b>(y);
+        cv::Vec3b* oPtr = out.ptr<cv::Vec3b>(y);
 
-        for (int x = 0; x < inRgb.cols; ++x) {
-            if (mPtr[x] > 0) {
-                float d = dPtr[x];
-                float t = std::clamp(d / maxDist, 0.0f, 1.0f);
-                float weight = 1.0f - 0.5f * t;
-
-                cv::Vec3b p = inPtr[x];
-                for (int c = 0; c < 3; ++c) {
-                    float val = static_cast<float>(p[c]);
-                    if (useGain) {
-                        float g = 1.0f + static_cast<float>(gain[c] - 1.0) * weight;
-                        val *= g;
-                    } else {
-                        float off = static_cast<float>(offset[c]) * weight;
-                        val += off;
-                    }
-                    outPtr[x][c] = cv::saturate_cast<uchar>(val);
-                }
-            }
+        for (int x = 0; x < srcRgb.cols; ++x) {
+            if (mPtr[x] == 0) continue;
+            float t = std::clamp(dPtr[x] / bandF, 0.0f, 1.0f);
+            t = t * t * (3.0f - 2.0f * t); // smoothstep
+            const cv::Vec3b& s = sPtr[x];
+            const cv::Vec3b& p = iPtr[x];
+            oPtr[x] = cv::Vec3b(
+                cv::saturate_cast<uchar>(s[0] + (p[0] - s[0]) * t),
+                cv::saturate_cast<uchar>(s[1] + (p[1] - s[1]) * t),
+                cv::saturate_cast<uchar>(s[2] + (p[2] - s[2]) * t));
         }
     }
-
-    return matched;
-}
-
-static cv::Mat seamlessCompositePipeline(const cv::Mat& srcRgb,
-                                          const cv::Mat& inRgb,
-                                          const cv::Mat& binMask) {
-    int maxDim = std::max(srcRgb.cols, srcRgb.rows);
-    int featherPx = std::clamp(maxDim / 200, 4, 18);
-
-    // Step 1: Color-match the inpainted border to the original pixels
-    cv::Mat colorMatchedRgb = colorMatchBorder(srcRgb, inRgb, binMask);
-
-    cv::Mat finalRgb;
-    bool seamlessDone = false;
-
-    if (cv::countNonZero(binMask) > 0) {
-        // Step 2: cv::seamlessClone with NORMAL_CLONE
-        try {
-            cv::Mat cloneMask = binMask.clone();
-            if (cloneMask.rows > 4 && cloneMask.cols > 4) {
-                cloneMask.row(0).setTo(0);
-                cloneMask.row(1).setTo(0);
-                cloneMask.row(cloneMask.rows - 1).setTo(0);
-                cloneMask.row(cloneMask.rows - 2).setTo(0);
-                cloneMask.col(0).setTo(0);
-                cloneMask.col(1).setTo(0);
-                cloneMask.col(cloneMask.cols - 1).setTo(0);
-                cloneMask.col(cloneMask.cols - 2).setTo(0);
-            }
-
-            if (cv::countNonZero(cloneMask) > 0) {
-                cv::Point center(srcRgb.cols / 2, srcRgb.rows / 2);
-                cv::Mat clonedResult;
-                cv::seamlessClone(colorMatchedRgb, srcRgb, cloneMask, center, clonedResult, cv::NORMAL_CLONE);
-
-                // Step 3: Feathered edge blend on cloned result
-                featheredBlend(srcRgb, clonedResult, binMask, finalRgb, featherPx);
-                seamlessDone = true;
-            }
-        } catch (const cv::Exception& e) {
-            LOGW("cv::seamlessClone failed: %s", e.what());
-        } catch (...) {
-            LOGW("cv::seamlessClone threw unknown exception");
-        }
-    }
-
-    // Step 4: Fall back to feathered-only if seamlessClone failed or threw
-    if (!seamlessDone) {
-        featheredBlend(srcRgb, colorMatchedRgb, binMask, finalRgb, featherPx);
-    }
-
-    return finalRgb;
+    return out;
 }
 
 static inline cv::Mat inpaintHybrid(const cv::Mat& srcRgb, const cv::Mat& maskFull,
-                                     int radius, int featherPx) {
+                                     int radius) {
     cv::Mat outTelea, outNs, combined;
     cv::inpaint(srcRgb, maskFull, outTelea, static_cast<double>(radius), cv::INPAINT_TELEA);
     cv::inpaint(srcRgb, maskFull, outNs, static_cast<double>(radius + 2), cv::INPAINT_NS);
@@ -261,7 +160,6 @@ Java_com_example_magicimagepro_ml_NativeProcessor_processImage(
 
     int maxDim = std::max(static_cast<int>(infoOrig.width), static_cast<int>(infoOrig.height));
     int dilatePx = std::clamp(maxDim / 160, 5, 22);
-    int featherPx = std::clamp(maxDim / 200, 4, 18);
     int inpaintRadius = std::clamp(maxDim / 240, 4, 15);
 
     cv::Mat dilatedMask1, dilatedMask2;
@@ -280,7 +178,7 @@ Java_com_example_magicimagepro_ml_NativeProcessor_processImage(
     cv::Mat srcRgb;
     cv::cvtColor(srcMat, srcRgb, cv::COLOR_RGBA2RGB);
 
-    cv::Mat inpaintedRgb = inpaintHybrid(srcRgb, contourArea, inpaintRadius, featherPx);
+    cv::Mat inpaintedRgb = inpaintHybrid(srcRgb, contourArea, inpaintRadius);
 
     std::vector<cv::Mat> inRgba(4);
     cv::split(srcMat, inRgba);
