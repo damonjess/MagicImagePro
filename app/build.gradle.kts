@@ -43,6 +43,7 @@ android {
 
     androidResources {
         noCompress += "tflite"
+        noCompress += "onnx"
     }
 
     packaging {
@@ -71,6 +72,7 @@ dependencies {
     implementation(libs.tensorflow.lite.support)
     implementation(libs.tensorflow.lite.gpu)
 
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.30.0")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("com.google.code.gson:gson:2.10.1")
     implementation("com.alibaba.android:mnn:0.0.8")

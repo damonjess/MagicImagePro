@@ -1,5 +1,8 @@
 package com.example.magicimagepro.ml
 
+import ai.onnxruntime.OnnxTensor
+import ai.onnxruntime.OrtEnvironment
+import ai.onnxruntime.OrtSession
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BlurMaskFilter
@@ -10,46 +13,70 @@ import android.graphics.PorterDuff
 import android.graphics.PorterDuffXfermode
 import android.graphics.Rect
 import android.util.Log
-
+import java.io.File
+import java.nio.FloatBuffer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
-class ObjectRemover(context: Context) : TFLiteModel(context, "lama_dilated-tflite-float.tflite") {
+/**
+ * Object removal powered by the original big-lama inpainting model
+ * (SAIC LaMa, Places2 checkpoint), executed with ONNX Runtime.
+ *
+ * The ONNX export (Carve/LaMa-ONNX) has a fixed 512x512 input:
+ *   image: float32 [N,3,512,512] in [0,1]  (NCHW)
+ *   mask : float32 [N,1,512,512] in {0,1}  (NCHW, 1 = hole)
+ *   out  : float32 [N,3,512,512] in [0,255] (NCHW)
+ *
+ * High-resolution photos are handled by running the fixed-size graph over
+ * native-resolution 512px tiles that overlap around the hole, then merging
+ * the results with an edge-fade blend. Texture is generated 1:1, so the
+ * result stays as sharp as the photo it came from.
+ */
+class ObjectRemover(context: Context) {
 
     private val modelWidth = 512
     private val modelHeight = 512
     private val nativeProcessor = NativeProcessor()
 
-    // Reusable inference buffers (the model graph is a fixed 512x512).
-    private val imgBuf = ByteBuffer.allocateDirect(4 * modelWidth * modelHeight * 3).order(ByteOrder.nativeOrder())
-    private val maskBuf = ByteBuffer.allocateDirect(4 * modelWidth * modelHeight * 1).order(ByteOrder.nativeOrder())
-    private val outputBuf = ByteBuffer.allocateDirect(4 * modelWidth * modelHeight * 3).order(ByteOrder.nativeOrder())
-
-    private val imageInputIndex: Int
-    private val maskInputIndex: Int
-    private val imageIsNchw: Boolean
-    private val maskIsNchw: Boolean
+    private val ortEnv: OrtEnvironment = OrtEnvironment.getEnvironment()
+    private val session: OrtSession
+    private val imageInputName: String
+    private val maskInputName: String
 
     init {
-        val inputCount = interpreter.inputTensorCount
-        require(inputCount == 2) { "LaMa model must have image and mask inputs" }
-        imageInputIndex = (0 until inputCount).firstOrNull { index ->
-            val name = interpreter.getInputTensor(index).name().lowercase()
-            name.contains("painted") || name.contains("image")
-        } ?: 0
-        maskInputIndex = (0 until inputCount).firstOrNull { index ->
-            interpreter.getInputTensor(index).name().lowercase().contains("mask")
-        } ?: (1 - imageInputIndex)
-        require(imageInputIndex != maskInputIndex) { "LaMa image and mask inputs are ambiguous" }
+        val options = OrtSession.SessionOptions().apply {
+            setIntraOpNumThreads(4)
+        }
+        val modelFile = ensureModelFile(context)
+        session = ortEnv.createSession(modelFile.absolutePath, options)
 
-        val imageShape = interpreter.getInputTensor(imageInputIndex).shape()
-        val maskShape = interpreter.getInputTensor(maskInputIndex).shape()
-        imageIsNchw = imageShape.size == 4 && imageShape[1] == 3
-        maskIsNchw = maskShape.size == 4 && maskShape[1] == 1
+        val names = session.inputNames.toList()
+        require(names.size == 2) { "LaMa model must have image and mask inputs" }
+        imageInputName = names.firstOrNull { it.contains("image") || it.contains("painted") } ?: names[0]
+        maskInputName = names.firstOrNull { it.contains("mask") } ?: names[1]
+        require(imageInputName != maskInputName) { "LaMa image and mask inputs are ambiguous" }
+        Log.d("LaMa", "ONNX session ready; inputs: image='$imageInputName' mask='$maskInputName'")
+    }
+
+    fun close() {
+        session.close()
+    }
+
+    private fun ensureModelFile(context: Context): File {
+        val f = File(context.filesDir, "big_lama.onnx")
+        if (f.exists() && f.length() > 0L) return f
+        context.assets.open("big_lama.onnx").use { input ->
+            val tmp = File.createTempFile("big_lama", ".onnx", context.cacheDir)
+            tmp.outputStream().use { input.copyTo(it) }
+            if (!tmp.renameTo(f)) {
+                tmp.copyTo(f, overwrite = true)
+                tmp.delete()
+            }
+        }
+        return f
     }
 
     suspend fun removeObject(image: Bitmap, mask: Bitmap): Bitmap = withContext(Dispatchers.Default) {
@@ -60,8 +87,7 @@ class ObjectRemover(context: Context) : TFLiteModel(context, "lama_dilated-tflit
         val safeMask = mask.copy(Bitmap.Config.ARGB_8888, true)
 
         // Scale-aware dilation so fur wisps, anti-aliased brush edges and the soft
-        // shadow halo around the object are fully inside the hole. The old fixed
-        // 2-4px dilation left a visible ghost outline of the removed object.
+        // shadow halo around the object are fully inside the hole.
         val dilatedMask = dilateMask(safeMask, dilationRadiusPx(max(w, h)))
         safeMask.recycle()
 
@@ -80,15 +106,19 @@ class ObjectRemover(context: Context) : TFLiteModel(context, "lama_dilated-tflit
             // Small photos already run at (near) native resolution in one pass.
             runLaMaOnBitmap(safeImage, dilatedMask)
         } else {
-            // KEY FIX: run the model on native-resolution 512x512 tiles that
-            // overlap around the hole, instead of squashing the whole image to
-            // 512x512 and stretching the answer back. Texture is generated 1:1,
-            // so the result no longer looks like an upscaled blur.
+            // Run the model on native-resolution 512x512 tiles that overlap
+            // around the hole, instead of squashing the whole image to 512x512.
             inpaintWithTiles(origPx, maskPx, w, h, bounds)
         }
 
-        val rawInpainted: Bitmap = if (isDegenerateOutput(aiInpainted, origPx, maskPx)) {
-            Log.w("LaMa", "AI output looks degenerate; using native fallback")
+        // Never return a no-op: if the model output is degenerate (checkerboard /
+        // flat fill) or barely changed the masked pixels, fall back to the native
+        // OpenCV inpainter so "Remove object" always does something.
+        val rawInpainted: Bitmap = if (
+            isDegenerateOutput(aiInpainted, origPx, maskPx) ||
+            maskedCoverage(aiInpainted, origPx, maskPx) < 0.55f
+        ) {
+            Log.w("LaMa", "AI output unusable (degenerate or no-op); using native fallback")
             aiInpainted.recycle()
             val fallback = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
             val status = nativeProcessor.processImage(safeImage, dilatedMask, fallback)
@@ -127,10 +157,7 @@ class ObjectRemover(context: Context) : TFLiteModel(context, "lama_dilated-tflit
     // Mask utilities
     // ---------------------------------------------------------------------
 
-    // Decide "selected" by LUMINANCE only, never by alpha. The mask is a binary image:
-    // opaque white = selected (to inpaint), opaque black = keep. Checking alpha would
-    // treat the opaque-black background (alpha 255) as selected and flood the whole
-    // image into the model as a hole, producing a white result.
+    // White = selected (to inpaint), black = keep. Luminance only.
     private fun isMaskPixel(c: Int): Boolean {
         return Color.red(c) > 127 || Color.green(c) > 127 || Color.blue(c) > 127
     }
@@ -138,8 +165,7 @@ class ObjectRemover(context: Context) : TFLiteModel(context, "lama_dilated-tflit
     private fun dilationRadiusPx(maxDim: Int): Int = (maxDim / 100).coerceIn(4, 28)
 
     /**
-     * Separable box dilation, O(w*h) regardless of radius. Replaces the old
-     * fixed-round 3x3 dilation whose radius capped out at ~4px on big photos.
+     * Separable box dilation, O(w*h) regardless of radius.
      */
     private fun dilateMask(mask: Bitmap, radius: Int): Bitmap {
         val w = mask.width
@@ -151,7 +177,9 @@ class ObjectRemover(context: Context) : TFLiteModel(context, "lama_dilated-tflit
         val tmp = BooleanArray(n)
         val out = BooleanArray(n)
 
-        // Horizontal pass with a sliding window count
+        // Horizontal pass with a sliding window count. Window at x covers
+        // [x-radius, x+radius]: entering pixel (x+radius+1) must INCREMENT the
+        // count, leaving pixel (x-radius) decrements it.
         for (y in 0 until h) {
             val row = y * w
             var count = 0
@@ -159,19 +187,19 @@ class ObjectRemover(context: Context) : TFLiteModel(context, "lama_dilated-tflit
             for (x in 0 until w) {
                 tmp[row + x] = count > 0
                 val add = x + radius + 1
-                if (add < w && src[row + add]) count--
+                if (add < w && src[row + add]) count++
                 val rem = x - radius
                 if (rem >= 0 && src[row + rem]) count--
             }
         }
-        // Vertical pass with a sliding window count
+        // Vertical pass with a sliding window count (same invariants)
         for (x in 0 until w) {
             var count = 0
             for (k in 0..min(radius, h - 1)) if (tmp[k * w + x]) count++
             for (y in 0 until h) {
                 out[y * w + x] = count > 0
                 val add = y + radius + 1
-                if (add < h && tmp[add * w + x]) count--
+                if (add < h && tmp[add * w + x]) count++
                 val rem = y - radius
                 if (rem >= 0 && tmp[rem * w + x]) count--
             }
@@ -211,12 +239,6 @@ class ObjectRemover(context: Context) : TFLiteModel(context, "lama_dilated-tflit
 
     private data class TileWindow(val x: Int, val y: Int)
 
-    /**
-     * Inpaints the masked area by running the fixed 512x512 LaMa graph over a
-     * grid of native-resolution 512px windows that overlap around the hole.
-     * Each tile sees real surrounding context at 1:1 scale; outputs are merged
-     * with an edge-fade weight so tile seams are invisible.
-     */
     private fun inpaintWithTiles(
         origPx: IntArray, maskPx: IntArray, w: Int, h: Int, bounds: Rect
     ): Bitmap {
@@ -375,31 +397,99 @@ class ObjectRemover(context: Context) : TFLiteModel(context, "lama_dilated-tflit
     }
 
     // ---------------------------------------------------------------------
-    // Model runner
+    // ONNX model runner
     // ---------------------------------------------------------------------
 
     /** Runs the 512x512 graph once and returns the 512x512 result. */
     private fun runLaMaCore(input: Bitmap, inputMask: Bitmap): Bitmap {
-        require(input.width == modelWidth && input.height == modelHeight) {
-            "runLaMaCore expects a ${modelWidth}x${modelHeight} tile"
+        val t = modelWidth
+        require(input.width == t && input.height == t) {
+            "runLaMaCore expects a ${t}x${t} tile"
         }
-        fillImageBuffer(input, inputMask, imgBuf, imageIsNchw)
-        fillMaskBuffer(inputMask, maskBuf, maskIsNchw)
-        imgBuf.rewind()
-        maskBuf.rewind()
-        outputBuf.rewind()
+        val total = t * t
 
-        interpreter.runForMultipleInputsOutputs(
-            arrayOf<Any>(imgBuf, maskBuf).also { inputs ->
-                inputs[imageInputIndex] = imgBuf
-                inputs[maskInputIndex] = maskBuf
-            },
-            mapOf(0 to outputBuf)
+        val px = IntArray(total)
+        input.getPixels(px, 0, t, 0, 0, t, t)
+        val mpx = IntArray(total)
+        inputMask.getPixels(mpx, 0, t, 0, 0, t, t)
+
+        val imgArr = FloatArray(total * 3)
+        val maskArr = FloatArray(total)
+        val rOffset = 0
+        val gOffset = total
+        val bOffset = total * 2
+        for (i in 0 until total) {
+            val c = px[i]
+            imgArr[rOffset + i] = Color.red(c) / 255f
+            imgArr[gOffset + i] = Color.green(c) / 255f
+            imgArr[bOffset + i] = Color.blue(c) / 255f
+            maskArr[i] = if (isMaskPixel(mpx[i])) 1f else 0f
+        }
+
+        val imgTensor = OnnxTensor.createTensor(
+            ortEnv, FloatBuffer.wrap(imgArr), longArrayOf(1, 3, t.toLong(), t.toLong())
         )
+        val maskTensor = OnnxTensor.createTensor(
+            ortEnv, FloatBuffer.wrap(maskArr), longArrayOf(1, 1, t.toLong(), t.toLong())
+        )
+        try {
+            session.run(mapOf(imageInputName to imgTensor, maskInputName to maskTensor)).use { results ->
+                val outTensor = results[0] as OnnxTensor
+                return convertOutputToBitmap(outTensor, t)
+            }
+        } finally {
+            imgTensor.close()
+            maskTensor.close()
+        }
+    }
 
-        val outputShape = interpreter.getOutputTensor(0).shape()
-        val isNchwOutput = outputShape.size == 4 && outputShape[1] == 3
-        return convertOutputToBitmap(outputBuf, modelWidth, modelHeight, isNchwOutput)
+    private fun convertOutputToBitmap(outTensor: OnnxTensor, size: Int): Bitmap {
+        val total = size * size
+        val buf = outTensor.floatBuffer
+        val floats = FloatArray(buf.remaining())
+        buf.get(floats)
+
+        val shape = outTensor.info.shape
+        val isNchw = shape.size == 4 && shape[1] == 3L
+
+        // Detect output scale: this export emits [0,255]; be tolerant of
+        // exports that emit [0,1] or [-1,1].
+        var minVal = Float.MAX_VALUE
+        var maxVal = -Float.MAX_VALUE
+        val checkStep = maxOf(1, floats.size / 1000)
+        for (i in floats.indices step checkStep) {
+            val v = floats[i]
+            if (v < minVal) minVal = v
+            if (v > maxVal) maxVal = v
+        }
+        val scale = when {
+            maxVal > 2.0f -> 1f        // already [0,255]
+            minVal < -0.1f -> 127.5f   // [-1,1]
+            else -> 255f               // [0,1]
+        }
+
+        val out = IntArray(total)
+        if (isNchw) {
+            val rOffset = 0
+            val gOffset = total
+            val bOffset = total * 2
+            for (i in 0 until total) {
+                val r = (floats[rOffset + i] * scale).toInt().coerceIn(0, 255)
+                val g = (floats[gOffset + i] * scale).toInt().coerceIn(0, 255)
+                val b = (floats[bOffset + i] * scale).toInt().coerceIn(0, 255)
+                out[i] = Color.rgb(r, g, b)
+            }
+        } else {
+            for (i in 0 until total) {
+                val r = (floats[i * 3] * scale).toInt().coerceIn(0, 255)
+                val g = (floats[i * 3 + 1] * scale).toInt().coerceIn(0, 255)
+                val b = (floats[i * 3 + 2] * scale).toInt().coerceIn(0, 255)
+                out[i] = Color.rgb(r, g, b)
+            }
+        }
+        val bm = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
+        bm.setPixels(out, 0, size, 0, 0, size, size)
+        return bm
     }
 
     /** Whole-image path for photos that already fit the 512x512 graph. */
@@ -441,11 +531,14 @@ class ObjectRemover(context: Context) : TFLiteModel(context, "lama_dilated-tflit
         return resized
     }
 
+    // ---------------------------------------------------------------------
+    // Output sanity checks
+    // ---------------------------------------------------------------------
+
     /**
-     * Detects a broken model output (the old green/magenta checkerboard or a
-     * collapsed flat fill) *inside the masked region only*. The previous
-     * isMostlyWhite check sampled the whole image and false-triggered on bright
-     * scenes (white walls, mattresses), throwing away good results.
+     * Detects a broken model output (green/magenta checkerboard or collapsed
+     * flat fill) inside the masked region only. The old whole-image "mostly
+     * white" check false-triggered on bright scenes and threw away good results.
      */
     private fun isDegenerateOutput(ai: Bitmap, origPx: IntArray, maskPx: IntArray): Boolean {
         val w = ai.width
@@ -482,110 +575,33 @@ class ObjectRemover(context: Context) : TFLiteModel(context, "lama_dilated-tflit
         val aiVar = max(0.0, aiSqSum / n - aiMean * aiMean)
         val origMean = origSum / n
         val origVar = max(0.0, origSqSum / n - origMean * origMean)
-        // Collapsed to a flat color while the original region had real texture.
         return aiVar < 4.0 && origVar > 150.0
     }
 
-    private fun fillImageBuffer(img: Bitmap, mask: Bitmap, imgBuf: ByteBuffer, isNchw: Boolean) {
-        val w = img.width
-        val h = img.height
-        val total = w * h
-        val iPx = IntArray(total)
-        val mPx = IntArray(total)
-        img.getPixels(iPx, 0, w, 0, 0, w, h)
-        mask.getPixels(mPx, 0, w, 0, 0, w, h)
-        imgBuf.rewind()
-
-        if (isNchw) {
-            for (i in 0 until total) {
-                val isMasked = isMaskPixel(mPx[i])
-                imgBuf.putFloat(if (isMasked) 0f else Color.red(iPx[i]) / 255f)
-            }
-            for (i in 0 until total) {
-                val isMasked = isMaskPixel(mPx[i])
-                imgBuf.putFloat(if (isMasked) 0f else Color.green(iPx[i]) / 255f)
-            }
-            for (i in 0 until total) {
-                val isMasked = isMaskPixel(mPx[i])
-                imgBuf.putFloat(if (isMasked) 0f else Color.blue(iPx[i]) / 255f)
-            }
-        } else {
-            for (i in 0 until total) {
-                val isMasked = isMaskPixel(mPx[i])
-                val c = iPx[i]
-                imgBuf.putFloat(if (isMasked) 0f else Color.red(c) / 255f)
-                imgBuf.putFloat(if (isMasked) 0f else Color.green(c) / 255f)
-                imgBuf.putFloat(if (isMasked) 0f else Color.blue(c) / 255f)
-            }
+    /**
+     * Fraction of masked pixels the model actually changed. A healthy
+     * generative fill rewrites essentially the whole hole.
+     */
+    private fun maskedCoverage(ai: Bitmap, origPx: IntArray, maskPx: IntArray): Float {
+        val w = ai.width
+        val h = ai.height
+        val aiPx = IntArray(w * h)
+        ai.getPixels(aiPx, 0, w, 0, 0, w, h)
+        var n = 0
+        var changed = 0
+        for (i in aiPx.indices) {
+            if (!isMaskPixel(maskPx[i])) continue
+            n++
+            val a = aiPx[i]
+            val o = origPx[i]
+            val d = maxOf(
+                abs(Color.red(a) - Color.red(o)),
+                abs(Color.green(a) - Color.green(o)),
+                abs(Color.blue(a) - Color.blue(o))
+            )
+            if (d >= 10) changed++
         }
-    }
-
-    private fun fillMaskBuffer(mask: Bitmap, maskBuf: ByteBuffer, isNchw: Boolean) {
-        val w = mask.width
-        val h = mask.height
-        val total = w * h
-        val mPx = IntArray(total)
-        mask.getPixels(mPx, 0, w, 0, 0, w, h)
-        maskBuf.rewind()
-
-        for (i in 0 until total) {
-            maskBuf.putFloat(if (isMaskPixel(mPx[i])) 1f else 0f)
-        }
-    }
-
-    private fun convertOutputToBitmap(buf: ByteBuffer, w: Int, h: Int, isNchw: Boolean): Bitmap {
-        buf.rewind()
-        val total = w * h
-        val out = IntArray(total)
-
-        val floatBuf = buf.asFloatBuffer()
-        val floats = FloatArray(floatBuf.remaining())
-        floatBuf.get(floats)
-
-        var minVal = Float.MAX_VALUE
-        var maxVal = -Float.MAX_VALUE
-        val checkStep = maxOf(1, floats.size / 1000)
-        for (i in floats.indices step checkStep) {
-            val v = floats[i]
-            if (v < minVal) minVal = v
-            if (v > maxVal) maxVal = v
-        }
-
-        val mode = when {
-            maxVal > 2.0f -> 0 // In [0, 255]
-            minVal < -0.1f -> 1 // In [-1, 1]
-            else -> 2 // In [0, 1]
-        }
-
-        fun toByte(v: Float): Int {
-            return when (mode) {
-                0 -> v.coerceIn(0f, 255f).toInt()
-                1 -> ((v + 1f) * 127.5f).coerceIn(0f, 255f).toInt()
-                else -> (v * 255f).coerceIn(0f, 255f).toInt()
-            }
-        }
-
-        if (isNchw) {
-            val rOffset = 0
-            val gOffset = total
-            val bOffset = total * 2
-            for (i in 0 until total) {
-                val r = toByte(floats[rOffset + i])
-                val g = toByte(floats[gOffset + i])
-                val b = toByte(floats[bOffset + i])
-                out[i] = Color.rgb(r, g, b)
-            }
-        } else {
-            for (i in 0 until total) {
-                val r = toByte(floats[i * 3])
-                val g = toByte(floats[i * 3 + 1])
-                val b = toByte(floats[i * 3 + 2])
-                out[i] = Color.rgb(r, g, b)
-            }
-        }
-        val bm = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        bm.setPixels(out, 0, w, 0, 0, w, h)
-        return bm
+        return if (n == 0) 1f else changed.toFloat() / n
     }
 
     // ---------------------------------------------------------------------
@@ -673,10 +689,8 @@ class ObjectRemover(context: Context) : TFLiteModel(context, "lama_dilated-tflit
 
         for (i in 0 until total) {
             if (isMasked[i]) {
-                // Interior of selection stays 100% opaque (alpha = 255)
                 blurredPixels[i] = Color.WHITE
             } else {
-                // Feathered outward edge: keep alpha from blur
                 val a = Color.alpha(blurredPixels[i])
                 blurredPixels[i] = Color.argb(a, 255, 255, 255)
             }
