@@ -156,13 +156,15 @@ class ObjectRemover(context: Context) {
             fallback
         }
 
-        // Anti-tell finishing pass: phone photos carry sensor grain, but both the
-        // AI fill and the OpenCV repair come out smoother than their surroundings.
-        // That local smoothness difference is a big part of why removed areas look
-        // "too clean". Re-inject noise matched to the photo's own grain level.
-        val grainStd = estimateSensorGrain(origPx, maskPx, w, h, bounds)
-        if (grainStd > 0.3f) {
-            applyGrain(resultBitmap, maskPx, w, h, grainStd)
+        // Anti-tell finishing pass: phone photos carry sensor grain, and the AI
+        // fill comes out smoother than its surroundings. Re-inject noise matched
+        // to the photo's own grain level. (The native basic-repair path already
+        // applies its own grain in C++, so only grain the AI path here.)
+        if (lastRunDegraded == null) {
+            val grainStd = estimateSensorGrain(origPx, maskPx, w, h, bounds)
+            if (grainStd > 0.3f) {
+                applyGrain(resultBitmap, maskPx, w, h, grainStd)
+            }
         }
 
         rawInpainted.recycle()

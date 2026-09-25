@@ -4,6 +4,7 @@
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/photo.hpp>
+#include "inpaint_engine.h"
 #include <algorithm>
 #include <vector>
 
@@ -206,7 +207,15 @@ Java_com_example_magicimagepro_ml_NativeProcessor_processImage(
     cv::Mat srcRgb;
     cv::cvtColor(srcMat, srcRgb, cv::COLOR_RGBA2RGB);
 
-    cv::Mat inpaintedRgb = inpaintHybrid(srcRgb, contourArea, inpaintRadius);
+    // Primary engine: content-aware PatchMatch fill (real copied texture).
+    // Falls back to the multi-scale diffusion fill if anything goes wrong.
+    cv::Mat inpaintedRgb;
+    try {
+        inpaintedRgb = inpaint_engine::fillHole(srcRgb, contourArea);
+    } catch (const cv::Exception& e) {
+        LOGW("fillHole failed: %s", e.what());
+        inpaintedRgb = inpaintHybrid(srcRgb, contourArea, inpaintRadius);
+    }
 
     std::vector<cv::Mat> inRgba(4);
     cv::split(srcMat, inRgba);

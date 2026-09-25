@@ -159,6 +159,11 @@ class MainActivity : AppCompatActivity() {
                         }
                         fallback
                     }
+                    if (remover == null) {
+                        withContext(Dispatchers.Main) {
+                            showEngineBadge("basic repair · engine unavailable")
+                        }
+                    }
                     if (mask != rawMask) {
                         mask.recycle()
                     }
@@ -170,6 +175,15 @@ class MainActivity : AppCompatActivity() {
                                 Toast.LENGTH_LONG
                             ).show()
                         }
+                    }
+                    withContext(Dispatchers.Main) {
+                        val label = when {
+                            remover == null -> "basic repair · engine unavailable"
+                            remover?.lastRunDegraded != null ->
+                                "basic repair · ${remover?.lastRunDegraded}"
+                            else -> "AI fill (big-lama)"
+                        }
+                        showEngineBadge(label)
                     }
                     Result.success(result)
                 } catch (e: Exception) {
@@ -195,6 +209,15 @@ class MainActivity : AppCompatActivity() {
         }
     }
     
+    private fun showEngineBadge(label: String) {
+        binding.engineBadge.text = label
+        binding.engineBadge.visibility = View.VISIBLE
+        binding.engineBadge.postDelayed(
+            { binding.engineBadge.visibility = View.GONE },
+            4000
+        )
+    }
+
     private fun isMaskEmpty(mask: Bitmap): Boolean {
         val w = mask.width
         val h = mask.height

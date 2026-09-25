@@ -135,6 +135,21 @@
             android:layout_gravity="center"
             android:visibility="gone"
             android:indeterminateTint="#3DDC84" />
+
+        <!-- Engine badge: shows which engine produced the last edit -->
+        <TextView
+            android:id="@+id/engineBadge"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="top|end"
+            android:layout_margin="12dp"
+            android:background="#99000000"
+            android:paddingHorizontal="10dp"
+            android:paddingVertical="4dp"
+            android:text=""
+            android:textColor="#FFFFFF"
+            android:textSize="11sp"
+            android:visibility="gone" />
     </FrameLayout>
 
     <!-- Bottom Control Sheet -->
