@@ -20,14 +20,15 @@ import kotlinx.coroutines.withContext
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.sqrt
 
 /**
  * Object removal powered by the original big-lama inpainting model
  * (SAIC LaMa, Places2 checkpoint), executed with ONNX Runtime.
  *
  * The ONNX export (Carve/LaMa-ONNX) has a fixed 512x512 input:
- *   image: float32 [N,3,512,512] in [0,1]  (NCHW)
- *   mask : float32 [N,1,512,512] in {0,1}  (NCHW, 1 = hole)
+ *   image: float32 [N,512,512,3] in [0,1]  (NHWC)
+ *   mask : float32 [N,512,512,1] in {0,1}  (NHWC, 1 = hole)
  *   out  : float32 [N,3,512,512] in [0,255] (NCHW)
  *
  * High-resolution photos are handled by running the fixed-size graph over
@@ -40,6 +41,14 @@ class ObjectRemover(context: Context) {
     private val modelWidth = 512
     private val modelHeight = 512
     private val nativeProcessor = NativeProcessor()
+
+    /**
+     * Reason the last [removeObject] run used the basic (OpenCV) repair instead
+     * of the AI fill, or null when the AI fill was used. Surfaced to the user
+     * so silent degradation is impossible.
+     */
+    var lastRunDegraded: String? = null
+        private set
 
     private val ortEnv: OrtEnvironment = OrtEnvironment.getEnvironment()
     private val session: OrtSession
@@ -80,6 +89,7 @@ class ObjectRemover(context: Context) {
     }
 
     suspend fun removeObject(image: Bitmap, mask: Bitmap): Bitmap = withContext(Dispatchers.Default) {
+        lastRunDegraded = null
         val w = image.width
         val h = image.height
 
@@ -114,11 +124,11 @@ class ObjectRemover(context: Context) {
         // Never return a no-op: if the model output is degenerate (checkerboard /
         // flat fill) or barely changed the masked pixels, fall back to the native
         // OpenCV inpainter so "Remove object" always does something.
-        val rawInpainted: Bitmap = if (
-            isDegenerateOutput(aiInpainted, origPx, maskPx) ||
-            maskedCoverage(aiInpainted, origPx, maskPx) < 0.55f
-        ) {
-            Log.w("LaMa", "AI output unusable (degenerate or no-op); using native fallback")
+        val degenerate = isDegenerateOutput(aiInpainted, origPx, maskPx)
+        val coverage = maskedCoverage(aiInpainted, origPx, maskPx)
+        val rawInpainted: Bitmap = if (degenerate || coverage < 0.55f) {
+            lastRunDegraded = if (degenerate) "corrupted output" else "empty fill (model echoed input)"
+            Log.w("LaMa", "AI output unusable ($lastRunDegraded); using native fallback")
             aiInpainted.recycle()
             val fallback = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
             val status = nativeProcessor.processImage(safeImage, dilatedMask, fallback)
@@ -146,11 +156,91 @@ class ObjectRemover(context: Context) {
             fallback
         }
 
+        // Anti-tell finishing pass: phone photos carry sensor grain, but both the
+        // AI fill and the OpenCV repair come out smoother than their surroundings.
+        // That local smoothness difference is a big part of why removed areas look
+        // "too clean". Re-inject noise matched to the photo's own grain level.
+        val grainStd = estimateSensorGrain(origPx, maskPx, w, h, bounds)
+        if (grainStd > 0.3f) {
+            applyGrain(resultBitmap, maskPx, w, h, grainStd)
+        }
+
         rawInpainted.recycle()
         safeImage.recycle()
         dilatedMask.recycle()
 
         resultBitmap
+    }
+
+    // ---------------------------------------------------------------------
+    // Grain matching
+    // ---------------------------------------------------------------------
+
+    /**
+     * Estimates the photo's sensor-grain strength near the hole: the standard
+     * deviation of high-frequency luminance on unmasked pixels around the
+     * masked bounds.
+     */
+    private fun estimateSensorGrain(
+        origPx: IntArray, maskPx: IntArray, w: Int, h: Int, bounds: Rect
+    ): Float {
+        val pad = 48
+        val l = max(0, bounds.left - pad)
+        val t = max(0, bounds.top - pad)
+        val r = min(w, bounds.right + pad)
+        val b = min(h, bounds.bottom + pad)
+        if (r - l < 4 || b - t < 4) return 0f
+
+        var sum = 0.0
+        var sqSum = 0.0
+        var n = 0
+        for (y in t + 1 until b - 1) {
+            val row = y * w
+            for (x in l + 1 until r - 1) {
+                val idx = row + x
+                if (isMaskPixel(maskPx[idx])) continue
+                // 3x3 box blur luminance as the local mean
+                var lumSum = 0.0
+                for (dy in -1..1) {
+                    val rr = (y + dy) * w
+                    for (dx in -1..1) {
+                        val c = origPx[rr + x + dx]
+                        lumSum += (Color.red(c) + Color.green(c) + Color.blue(c)) / 3.0
+                    }
+                }
+                val c = origPx[idx]
+                val lum = (Color.red(c) + Color.green(c) + Color.blue(c)) / 3.0
+                val highFreq = lum - lumSum / 9.0
+                sum += highFreq
+                sqSum += highFreq * highFreq
+                n++
+            }
+        }
+        if (n < 64) return 0f
+        val mean = sum / n
+        return sqrt(max(0.0, sqSum / n - mean * mean)).toFloat().coerceAtMost(6f)
+    }
+
+    /**
+     * Adds luminance noise with the given standard deviation to masked pixels
+     * (same offset on R/G/B, like real sensor noise).
+     */
+    private fun applyGrain(bmp: Bitmap, maskPx: IntArray, w: Int, h: Int, std: Float) {
+        val px = IntArray(w * h)
+        bmp.getPixels(px, 0, w, 0, 0, w, h)
+        val amp = std * 1.732f * 0.85f // uniform[-a,a] has std a/sqrt(3)
+        val rng = java.util.Random(System.nanoTime())
+        for (i in px.indices) {
+            if (!isMaskPixel(maskPx[i])) continue
+            val noise = ((rng.nextFloat() * 2f - 1f) * amp)
+            val c = px[i]
+            px[i] = Color.rgb(
+                (Color.red(c) + noise).toInt().coerceIn(0, 255),
+                (Color.green(c) + noise).toInt().coerceIn(0, 255),
+                (Color.blue(c) + noise).toInt().coerceIn(0, 255)
+            )
+        }
+        bmp.setPixels(px, 0, w, 0, 0, w, h)
     }
 
     // ---------------------------------------------------------------------

@@ -65,49 +65,77 @@ static cv::Mat seamlessCompositePipeline(const cv::Mat& srcRgb,
 
 static inline cv::Mat inpaintHybrid(const cv::Mat& srcRgb, const cv::Mat& maskFull,
                                      int radius) {
-    cv::Mat outTelea, outNs, combined;
+    // Fine passes at full resolution keep edges and structure near the rim.
+    cv::Mat outTelea, outNs;
     cv::inpaint(srcRgb, maskFull, outTelea, static_cast<double>(radius), cv::INPAINT_TELEA);
     cv::inpaint(srcRgb, maskFull, outNs, static_cast<double>(radius + 2), cv::INPAINT_NS);
 
-    cv::Mat edgeMask;
-    cv::Mat sobelX, sobelY;
+    cv::Mat edgeMask, sobelX, sobelY;
     cv::Sobel(srcRgb, sobelX, CV_32F, 1, 0, 3);
     cv::Sobel(srcRgb, sobelY, CV_32F, 0, 1, 3);
     cv::magnitude(sobelX, sobelY, edgeMask);
     edgeMask = edgeMask / 255.0;
 
-    cv::Mat blendW = cv::Mat::ones(srcRgb.size(), CV_32F) * 0.5f;
+    // fineMix = (1-w)*Telea + w*NS, weighted by local edge strength.
+    std::vector<cv::Mat> teleaCh, nsCh;
+    cv::split(outTelea, teleaCh);
+    cv::split(outNs, nsCh);
+    cv::Mat fineMix = cv::Mat::zeros(srcRgb.size(), CV_32FC3);
     for (int y = 0; y < srcRgb.rows; ++y) {
+        const uchar* mPtr = maskFull.ptr<uchar>(y);
+        cv::Vec3f* dst = fineMix.ptr<cv::Vec3f>(y);
         for (int x = 0; x < srcRgb.cols; ++x) {
-            if (maskFull.at<uchar>(y, x) > 0) {
-                float e = (edgeMask.at<cv::Vec3f>(y, x)[0] +
-                           edgeMask.at<cv::Vec3f>(y, x)[1] +
-                           edgeMask.at<cv::Vec3f>(y, x)[2]) / 3.0f;
-                if (e < 0.05f) {
-                    blendW.at<float>(y, x) = 0.3f;
-                } else if (e > 0.2f) {
-                    blendW.at<float>(y, x) = 0.7f;
-                }
-            } else {
-                blendW.at<float>(y, x) = 0.0f;
+            if (mPtr[x] == 0) continue;
+            float e = (edgeMask.at<cv::Vec3f>(y, x)[0] +
+                       edgeMask.at<cv::Vec3f>(y, x)[1] +
+                       edgeMask.at<cv::Vec3f>(y, x)[2]) / 3.0f;
+            float w = (e < 0.05f) ? 0.3f : (e > 0.2f ? 0.7f : 0.5f);
+            for (int c = 0; c < 3; ++c) {
+                float t = teleaCh[c].at<float>(y, x);
+                float n = nsCh[c].at<float>(y, x);
+                dst[x][c] = t * (1.0f - w) + n * w;
             }
         }
     }
 
-    std::vector<cv::Mat> teleaCh, nsCh, outCh;
-    cv::split(outTelea, teleaCh);
-    cv::split(outNs, nsCh);
-    outCh.resize(3);
-
-    for (size_t c = 0; c < 3; ++c) {
-        cv::Mat tF, nF;
-        teleaCh[c].convertTo(tF, CV_32F);
-        nsCh[c].convertTo(nF, CV_32F);
-        cv::Mat one = cv::Mat::ones(blendW.size(), CV_32F);
-        cv::Mat mixed = tF.mul(one - blendW) + nF.mul(blendW);
-        mixed.convertTo(outCh[c], CV_8U);
+    // Coarse pass at 1/4 resolution: diffusion inpainting propagates structure
+    // much better when run small, giving smoother low-frequency content across
+    // large holes instead of the telltale bright smear.
+    cv::Mat small, smallMask, smallFilled, up8, coarse;
+    cv::resize(srcRgb, small, cv::Size(), 0.25, 0.25, cv::INTER_AREA);
+    cv::resize(maskFull, smallMask, cv::Size(), 0.25, 0.25, cv::INTER_NEAREST);
+    cv::threshold(smallMask, smallMask, 0, 255, cv::THRESH_BINARY);
+    if (cv::countNonZero(smallMask) > 0) {
+        cv::inpaint(small, smallMask, smallFilled, 8.0, cv::INPAINT_TELEA);
+        cv::resize(smallFilled, up8, srcRgb.size(), 0, 0, cv::INTER_CUBIC);
+        up8.convertTo(coarse, CV_32FC3);
+    } else {
+        srcRgb.convertTo(coarse, CV_32FC3);
     }
-    cv::merge(outCh, combined);
+
+    // Blend fine -> coarse by distance from the hole edge: the rim keeps the
+    // structure-preserving fine result, the deep interior gets the smoother
+    // coarse fill.
+    cv::Mat distMap;
+    cv::distanceTransform(maskFull, distMap, cv::DIST_L2, 3);
+    const float deep = 40.0f;
+    cv::Mat combined;
+    fineMix.convertTo(combined, CV_8UC3);
+    for (int y = 0; y < srcRgb.rows; ++y) {
+        const uchar* mPtr = maskFull.ptr<uchar>(y);
+        const float* dPtr = distMap.ptr<float>(y);
+        const cv::Vec3f* cPtr = coarse.ptr<cv::Vec3f>(y);
+        cv::Vec3b* oPtr = combined.ptr<cv::Vec3b>(y);
+        for (int x = 0; x < srcRgb.cols; ++x) {
+            if (mPtr[x] == 0) continue;
+            float cw = std::clamp(dPtr[x] / deep, 0.0f, 1.0f);
+            cv::Vec3f f = fineMix.at<cv::Vec3f>(y, x);
+            oPtr[x] = cv::Vec3b(
+                cv::saturate_cast<uchar>(f[0] * (1.0f - cw) + cPtr[x][0] * cw),
+                cv::saturate_cast<uchar>(f[1] * (1.0f - cw) + cPtr[x][1] * cw),
+                cv::saturate_cast<uchar>(f[2] * (1.0f - cw) + cPtr[x][2] * cw));
+        }
+    }
 
     return seamlessCompositePipeline(srcRgb, combined, maskFull);
 }

@@ -24,6 +24,7 @@ import com.example.magicimagepro.ml.NativeProcessor
 import com.example.magicimagepro.ml.ObjectRemover
 import com.example.magicimagepro.ml.ObjectSnapper
 import com.example.magicimagepro.ui.ToolMode
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
@@ -34,6 +35,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var binding: ActivityMainBinding
     private var currentBitmap: Bitmap? = null
     private var objectRemover: ObjectRemover? = null
+    private var objectRemoverDeferred: Deferred<ObjectRemover?>? = null
+    private var objectRemoverError: String? = null
     @Suppress("unused")
     private var objectSnapper: ObjectSnapper? = null
     @Suppress("unused")
@@ -68,10 +71,16 @@ class MainActivity : AppCompatActivity() {
         applyWindowInsets()
         
         lifecycleScope.launch(Dispatchers.Default) {
-            try {
-                objectRemover = ObjectRemover(this@MainActivity)
-            } catch (e: Exception) {
-                e.printStackTrace()
+            objectRemoverDeferred = lifecycleScope.async(Dispatchers.Default) {
+                try {
+                    ObjectRemover(this@MainActivity).also { objectRemover = it }
+                } catch (e: Exception) {
+                    // Never swallow engine-load failures: they are reported to the
+                    // user when REMOVE OBJECT is pressed (see btnProcess).
+                    objectRemoverError = e.message ?: e::class.simpleName
+                    e.printStackTrace()
+                    null
+                }
             }
         }
         
@@ -129,7 +138,16 @@ class MainActivity : AppCompatActivity() {
                     } else {
                         rawMask
                     }
-                    val remover = objectRemover
+                    val remover = objectRemoverDeferred?.await()
+                    if (remover == null) {
+                        withContext(Dispatchers.Main) {
+                            Toast.makeText(
+                                this@MainActivity,
+                                "AI engine unavailable (${objectRemoverError ?: "not loaded yet"}) — using basic repair",
+                                Toast.LENGTH_LONG
+                            ).show()
+                        }
+                    }
                     val result = if (remover != null) {
                         remover.removeObject(image, mask)
                     } else {
@@ -143,6 +161,15 @@ class MainActivity : AppCompatActivity() {
                     }
                     if (mask != rawMask) {
                         mask.recycle()
+                    }
+                    remover?.lastRunDegraded?.let { reason ->
+                        withContext(Dispatchers.Main) {
+                            Toast.makeText(
+                                this@MainActivity,
+                                "Basic repair used (AI fill rejected: $reason)",
+                                Toast.LENGTH_LONG
+                            ).show()
+                        }
                     }
                     Result.success(result)
                 } catch (e: Exception) {
