@@ -13,6 +13,8 @@ import android.graphics.PorterDuff
 import android.graphics.PorterDuffXfermode
 import android.graphics.Rect
 import android.util.Log
+import androidx.core.graphics.createBitmap
+import androidx.core.graphics.scale
 import java.io.File
 import java.nio.FloatBuffer
 import kotlinx.coroutines.Dispatchers
@@ -20,6 +22,7 @@ import kotlinx.coroutines.withContext
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
 /**
@@ -31,10 +34,13 @@ import kotlin.math.sqrt
  *   mask : float32 [N,512,512,1] in {0,1}  (NHWC, 1 = hole)
  *   out  : float32 [N,3,512,512] in [0,255] (NCHW)
  *
- * High-resolution photos are handled by running the fixed-size graph over
- * native-resolution 512px tiles that overlap around the hole, then merging
- * the results with an edge-fade blend. Texture is generated 1:1, so the
- * result stays as sharp as the photo it came from.
+ * High-resolution photos are handled by cropping one square window around the
+ * hole (the object plus a ring of context) and squeezing that window into the
+ * graph's single 512x512 field of view, then mapping the fill back to native
+ * resolution. Showing the model the whole hole at once keeps the mask a small
+ * fraction of its input, so it reads the real surroundings and extends them.
+ * Feeding it crops that each cover only part of the hole made it invent
+ * content instead, leaving a dark smudged blob where a large object had been.
  */
 class ObjectRemover(context: Context) {
 
@@ -76,7 +82,7 @@ class ObjectRemover(context: Context) {
 
     private fun ensureModelFile(context: Context): File {
         val f = File(context.filesDir, "big_lama.onnx")
-        if (f.exists() && f.length() > 0L) return f
+        if ((f.exists()) && (f.length() > 0L)) return f
         context.assets.open("big_lama.onnx").use { input ->
             val tmp = File.createTempFile("big_lama", ".onnx", context.cacheDir)
             tmp.outputStream().use { input.copyTo(it) }
@@ -112,14 +118,7 @@ class ObjectRemover(context: Context) {
             return@withContext safeImage
         }
 
-        val aiInpainted: Bitmap = if (max(w, h) <= modelWidth) {
-            // Small photos already run at (near) native resolution in one pass.
-            runLaMaOnBitmap(safeImage, dilatedMask)
-        } else {
-            // Run the model on native-resolution 512x512 tiles that overlap
-            // around the hole, instead of squashing the whole image to 512x512.
-            inpaintWithTiles(origPx, maskPx, w, h, bounds)
-        }
+        val aiInpainted: Bitmap = inpaintWithContext(origPx, maskPx, w, h, bounds)
 
         // Never return a no-op: if the model output is degenerate (checkerboard /
         // flat fill) or barely changed the masked pixels, fall back to the native
@@ -130,7 +129,7 @@ class ObjectRemover(context: Context) {
             lastRunDegraded = if (degenerate) "corrupted output" else "empty fill (model echoed input)"
             Log.w("LaMa", "AI output unusable ($lastRunDegraded); using native fallback")
             aiInpainted.recycle()
-            val fallback = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            val fallback = createBitmap(w, h, Bitmap.Config.ARGB_8888)
             val status = nativeProcessor.processImage(safeImage, dilatedMask, fallback)
             if (status != 0) {
                 fallback.recycle()
@@ -143,15 +142,34 @@ class ObjectRemover(context: Context) {
             aiInpainted
         }
 
-        val finalResult = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        val status = nativeProcessor.seamlessComposite(safeImage, rawInpainted, dilatedMask, finalResult)
+        // The graph runs at 512x512, so a big hole comes back structurally
+        // right but smoothly rendered. Borrow the photo's own fine detail for
+        // it, otherwise the fill is the one soft patch in a grainy photo. Only
+        // meaningful for the AI fill (the basic repair grains itself in C++).
+        val polished: Bitmap = if (lastRunDegraded == null) {
+            val refined = createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            val refineStatus = nativeProcessor.refineFill(safeImage, rawInpainted, dilatedMask, refined)
+            if (refineStatus == 0) {
+                rawInpainted.recycle()
+                refined
+            } else {
+                Log.w("ObjectRemover", "Native refineFill failed ($refineStatus); using raw model output")
+                refined.recycle()
+                rawInpainted
+            }
+        } else {
+            rawInpainted
+        }
+
+        val finalResult = createBitmap(w, h, Bitmap.Config.ARGB_8888)
+        val status = nativeProcessor.seamlessComposite(safeImage, polished, dilatedMask, finalResult)
         val resultBitmap = if (status == 0) {
             finalResult
         } else {
             Log.w("ObjectRemover", "Native seamlessComposite failed ($status); using alpha blend fallback")
             finalResult.recycle()
-            val alphaMask = buildCompositeAlphaMask(dilatedMask, 12f)
-            val fallback = legacySeamlessComposite(safeImage, rawInpainted, alphaMask)
+            val alphaMask = buildCompositeAlphaMask(dilatedMask)
+            val fallback = legacySeamlessComposite(safeImage, polished, alphaMask)
             alphaMask.recycle()
             fallback
         }
@@ -167,7 +185,7 @@ class ObjectRemover(context: Context) {
             }
         }
 
-        rawInpainted.recycle()
+        polished.recycle()
         safeImage.recycle()
         dilatedMask.recycle()
 
@@ -184,7 +202,7 @@ class ObjectRemover(context: Context) {
      * masked bounds.
      */
     private fun estimateSensorGrain(
-        origPx: IntArray, maskPx: IntArray, w: Int, h: Int, bounds: Rect
+        origPx: IntArray, maskPx: IntArray, w: Int, h: Int, bounds: Rect,
     ): Float {
         val pad = 48
         val l = max(0, bounds.left - pad)
@@ -239,7 +257,7 @@ class ObjectRemover(context: Context) {
             px[i] = Color.rgb(
                 (Color.red(c) + noise).toInt().coerceIn(0, 255),
                 (Color.green(c) + noise).toInt().coerceIn(0, 255),
-                (Color.blue(c) + noise).toInt().coerceIn(0, 255)
+                (Color.blue(c) + noise).toInt().coerceIn(0, 255),
             )
         }
         bmp.setPixels(px, 0, w, 0, 0, w, h)
@@ -326,141 +344,108 @@ class ObjectRemover(context: Context) {
     }
 
     // ---------------------------------------------------------------------
-    // Tiled native-resolution inference
+    // Context-window inference
     // ---------------------------------------------------------------------
 
-    private data class TileWindow(val x: Int, val y: Int)
-
-    private fun inpaintWithTiles(
+    /**
+     * Fills the hole with a single run of the graph over one window that holds
+     * the whole hole plus a ring of surrounding context.
+     *
+     * The graph has a fixed 512x512 field of view. Crops that each cover only
+     * part of a large hole give it a mostly-masked view, and it invents content
+     * instead of reading the scene - which is what left a dark, blurry smudge
+     * behind a removed object. Squeezing the entire hole into one view keeps the
+     * mask a small fraction of the model's input, so it reconstructs the real
+     * structure (pavement joints continue, grass stays grass) even though the
+     * fill is synthesized at a lower resolution than the photo.
+     */
+    private fun inpaintWithContext(
         origPx: IntArray, maskPx: IntArray, w: Int, h: Int, bounds: Rect
     ): Bitmap {
-        val t = modelWidth
         val started = System.currentTimeMillis()
 
-        val accR = FloatArray(w * h)
-        val accG = FloatArray(w * h)
-        val accB = FloatArray(w * h)
-        val accW = FloatArray(w * h)
+        val padX = max(32, bounds.width() / 16)
+        val padY = max(32, bounds.height() / 16)
+        val x0 = max(0, bounds.left - padX)
+        val y0 = max(0, bounds.top - padY)
+        val x1 = min(w, bounds.right + padX)
+        val y1 = min(h, bounds.bottom + padY)
+        val cw = x1 - x0
+        val ch = y1 - y0
 
-        // If the whole hole (plus context margin) fits into one window, a single
-        // pass is enough. Otherwise cover it with an overlapping tile grid.
-        val margin = 48
-        val windows: List<TileWindow> = if (
-            bounds.width() + 2 * margin <= t && bounds.height() + 2 * margin <= t
-        ) {
-            val cx = bounds.centerX()
-            val cy = bounds.centerY()
-            val tx = if (w >= t) (cx - t / 2).coerceIn(0, w - t) else (w - t) / 2
-            val ty = if (h >= t) (cy - t / 2).coerceIn(0, h - t) else (h - t) / 2
-            listOf(TileWindow(tx, ty))
-        } else {
-            val stride = t - 96 // 96px overlap = 2x the 48px edge fade
-            val xs = planTileStarts(w, t, stride)
-            val ys = planTileStarts(h, t, stride)
-            ys.flatMap { ty -> xs.map { tx -> TileWindow(tx, ty) } }
-        }
+        val filled = runLaMaOnWindow(origPx, maskPx, w, h, x0, y0, cw, ch)
+        val filledPx = IntArray(cw * ch)
+        filled.getPixels(filledPx, 0, cw, 0, 0, cw, ch)
+        filled.recycle()
 
-        var ranTiles = 0
-        for (win in windows) {
-            if (!windowTouchesMask(maskPx, w, win.x, win.y, t)) continue
-            val tileStart = System.currentTimeMillis()
-            ranTiles++
-
-            val tileImgPx = windowPixels(origPx, w, h, win.x, win.y, t, t)
-            val tileMaskPx = windowPixels(maskPx, w, h, win.x, win.y, t, t)
-            val tileImg = bitmapFromPixels(tileImgPx, t, t)
-            val tileMask = bitmapFromPixels(tileMaskPx, t, t)
-            val tileOut = runLaMaCore(tileImg, tileMask)
-            tileImg.recycle()
-            tileMask.recycle()
-
-            val outPx = IntArray(t * t)
-            tileOut.getPixels(outPx, 0, t, 0, 0, t, t)
-            tileOut.recycle()
-
-            val fade = 48f
-            for (j in 0 until t) {
-                val iy = win.y + j
-                if (iy < 0 || iy >= h) continue
-                val wy = axisWeight(j, t, fade, fadeLeft = win.y > 0, fadeRight = win.y + t < h)
-                val row = iy * w
-                val outRow = j * t
-                for (i in 0 until t) {
-                    val ix = win.x + i
-                    if (ix < 0 || ix >= w) continue
-                    val idx = row + ix
-                    if (!isMaskPixel(maskPx[idx])) continue
-                    val wx = axisWeight(i, t, fade, fadeLeft = win.x > 0, fadeRight = win.x + t < w)
-                    val wgt = wx * wy
-                    if (wgt <= 0f) continue
-                    val c = outPx[outRow + i]
-                    accR[idx] += Color.red(c) * wgt
-                    accG[idx] += Color.green(c) * wgt
-                    accB[idx] += Color.blue(c) * wgt
-                    accW[idx] += wgt
-                }
-            }
-            Log.d("LaMa", "tile ${win.x},${win.y} took ${System.currentTimeMillis() - tileStart} ms")
-        }
-
-        // Composite: original everywhere, blended model output inside the mask.
+        // Composite: the original everywhere, the model output inside the mask.
         val outFull = IntArray(w * h)
         System.arraycopy(origPx, 0, outFull, 0, w * h)
-        for (i in outFull.indices) {
-            val aw = accW[i]
-            if (aw > 0f) {
-                val r = (accR[i] / aw).toInt().coerceIn(0, 255)
-                val g = (accG[i] / aw).toInt().coerceIn(0, 255)
-                val b = (accB[i] / aw).toInt().coerceIn(0, 255)
-                outFull[i] = Color.rgb(r, g, b)
+        var painted = 0
+        for (j in 0 until ch) {
+            val row = (y0 + j) * w
+            val fillRow = j * cw
+            for (i in 0 until cw) {
+                val idx = row + x0 + i
+                if (!isMaskPixel(maskPx[idx])) continue
+                outFull[idx] = filledPx[fillRow + i]
+                painted++
             }
         }
-        Log.d("LaMa", "tiled inpaint: $ranTiles/${windows.size} windows in ${System.currentTimeMillis() - started} ms")
-
-        val result = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        result.setPixels(outFull, 0, w, 0, 0, w, h)
-        return result
-    }
-
-    private fun planTileStarts(length: Int, tileSize: Int, stride: Int): List<Int> {
-        if (length <= tileSize) return listOf(0) // single reflect-padded window
-        val starts = mutableListOf<Int>()
-        var s = 0
-        while (s + tileSize < length) {
-            starts.add(s)
-            s += stride
-        }
-        val last = length - tileSize
-        if (starts.isEmpty() || starts.last() < last) starts.add(last)
-        return starts
+        val side = max(cw, ch)
+        Log.d(
+            "LaMa",
+            "context window ${cw}x${ch} at $x0,$y0 (model scale ${
+                min(1f, modelWidth.toFloat() / side)
+            }), painted $painted px in ${System.currentTimeMillis() - started} ms"
+        )
+        return bitmapFromPixels(outFull, w, h)
     }
 
     /**
-     * Weight of a pixel along one axis. Edges that touch the image border keep
-     * full weight (they are the only coverage there); interior edges fade over
-     * [fade] px so overlapping tiles blend smoothly.
+     * Runs the graph once over a rectangular crop of the photo and returns a
+     * crop-sized fill. The crop is reflection-padded to a square and scaled into
+     * the fixed 512x512 input, then the output is mapped back onto the crop; a
+     * crop that already fits the input runs at 1:1.
      */
-    private fun axisWeight(pos: Int, size: Int, fade: Float, fadeLeft: Boolean, fadeRight: Boolean): Float {
-        var d = Int.MAX_VALUE
-        if (fadeLeft) d = min(d, pos)
-        if (fadeRight) d = min(d, size - 1 - pos)
-        if (d == Int.MAX_VALUE) return 1f
-        if (d >= fade) return 1f
-        val t = d / fade
-        return t * t * (3f - 2f * t) // smoothstep
-    }
+    private fun runLaMaOnWindow(
+        origPx: IntArray, maskPx: IntArray, w: Int, h: Int,
+        x0: Int, y0: Int, cw: Int, ch: Int
+    ): Bitmap {
+        val cropImg = bitmapFromPixels(windowPixels(origPx, w, h, x0, y0, cw, ch), cw, ch)
+        val cropMask = bitmapFromPixels(windowPixels(maskPx, w, h, x0, y0, cw, ch), cw, ch)
 
-    private fun windowTouchesMask(maskPx: IntArray, w: Int, x0: Int, y0: Int, t: Int): Boolean {
-        val h = maskPx.size / w
-        val xEnd = min(x0 + t, w)
-        val yEnd = min(y0 + t, h)
-        for (y in max(0, y0) until yEnd) {
-            val row = y * w
-            for (x in max(0, x0) until xEnd) {
-                if (isMaskPixel(maskPx[row + x])) return true
-            }
+        val (squareImg, squareMask, padL, padT, _, _, squareSize) =
+            padToSquareReflect(cropImg, cropMask)
+        cropImg.recycle()
+        cropMask.recycle()
+
+        val inputImg = if (squareSize == modelWidth) squareImg
+        else squareImg.scale(modelWidth, modelHeight, filter = true)
+        val inputMask = if (squareSize == modelWidth) squareMask
+        else squareMask.scale(modelWidth, modelHeight, filter = true)
+        if (inputImg !== squareImg) squareImg.recycle()
+        if (inputMask !== squareMask) squareMask.recycle()
+
+        val raw = runLaMaCore(inputImg, inputMask)
+        inputImg.recycle()
+        inputMask.recycle()
+
+        // Undo the scale and the square padding to land back on the crop.
+        val s = modelWidth.toFloat() / squareSize
+        val cropL = (padL * s).roundToInt().coerceIn(0, modelWidth - 1)
+        val cropT = (padT * s).roundToInt().coerceIn(0, modelHeight - 1)
+        val cropR = (cropL + cw * s).roundToInt().coerceIn(cropL + 1, modelWidth)
+        val cropB = (cropT + ch * s).roundToInt().coerceIn(cropT + 1, modelHeight)
+        val outW = cropR - cropL
+        val outH = cropB - cropT
+        val cropped = if (cropL == 0 && cropT == 0 && outW == modelWidth && outH == modelHeight) {
+            raw
+        } else {
+            Bitmap.createBitmap(raw, cropL, cropT, outW, outH).also { raw.recycle() }
         }
-        return false
+        return if (cropped.width == cw && cropped.height == ch) cropped
+        else cropped.scale(cw, ch, filter = true).also { cropped.recycle() }
     }
 
     /** Crops a window (reflect-padded when it extends past the image). */
@@ -496,7 +481,7 @@ class ObjectRemover(context: Context) {
     private fun runLaMaCore(input: Bitmap, inputMask: Bitmap): Bitmap {
         val t = modelWidth
         require(input.width == t && input.height == t) {
-            "runLaMaCore expects a ${t}x${t} tile"
+            "runLaMaCore expects a ${t}x$t tile"
         }
         val total = t * t
 
@@ -507,14 +492,11 @@ class ObjectRemover(context: Context) {
 
         val imgArr = FloatArray(total * 3)
         val maskArr = FloatArray(total)
-        val rOffset = 0
-        val gOffset = total
-        val bOffset = total * 2
         for (i in 0 until total) {
             val c = px[i]
-            imgArr[rOffset + i] = Color.red(c) / 255f
-            imgArr[gOffset + i] = Color.green(c) / 255f
-            imgArr[bOffset + i] = Color.blue(c) / 255f
+            imgArr[i] = Color.red(c) / 255f
+            imgArr[total + i] = Color.green(c) / 255f
+            imgArr[total * 2 + i] = Color.blue(c) / 255f
             maskArr[i] = if (isMaskPixel(mpx[i])) 1f else 0f
         }
 
@@ -582,45 +564,6 @@ class ObjectRemover(context: Context) {
         val bm = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)
         bm.setPixels(out, 0, size, 0, 0, size, size)
         return bm
-    }
-
-    /** Whole-image path for photos that already fit the 512x512 graph. */
-    private fun runLaMaOnBitmap(input: Bitmap, inputMask: Bitmap): Bitmap {
-        val w = input.width
-        val h = input.height
-
-        val (squareImg, squareMask, padL, padT, padR, padB, squareSize) =
-            padToSquareReflect(input, inputMask)
-
-        val scaledImg = if (squareSize == modelWidth) squareImg
-        else Bitmap.createScaledBitmap(squareImg, modelWidth, modelHeight, true)
-        val scaledMask = if (squareSize == modelWidth) squareMask
-        else Bitmap.createScaledBitmap(squareMask, modelWidth, modelHeight, true)
-        if (scaledImg !== squareImg) squareImg.recycle()
-        if (scaledMask !== squareMask) squareMask.recycle()
-
-        val rawSquare = runLaMaCore(scaledImg, scaledMask)
-        scaledImg.recycle()
-        scaledMask.recycle()
-
-        val cropL = (padL * modelWidth / squareSize).coerceIn(0, modelWidth - 1)
-        val cropT = (padT * modelHeight / squareSize).coerceIn(0, modelHeight - 1)
-        val cropR = (modelWidth - padR * modelWidth / squareSize).coerceIn(cropL + 1, modelWidth)
-        val cropB = (modelHeight - padB * modelHeight / squareSize).coerceIn(cropT + 1, modelHeight)
-        val cropped = if (cropL == 0 && cropT == 0 && cropR == modelWidth && cropB == modelHeight) {
-            rawSquare
-        } else {
-            val cw = cropR - cropL
-            val ch = cropB - cropT
-            if (cw <= 0 || ch <= 0) {
-                rawSquare
-            } else {
-                Bitmap.createBitmap(rawSquare, cropL, cropT, cw, ch).also { rawSquare.recycle() }
-            }
-        }
-        val resized = if (cropped.width == w && cropped.height == h) cropped
-        else Bitmap.createScaledBitmap(cropped, w, h, true).also { cropped.recycle() }
-        return resized
     }
 
     // ---------------------------------------------------------------------
@@ -748,7 +691,8 @@ class ObjectRemover(context: Context) {
     // Composite fallbacks (only used if the native path fails)
     // ---------------------------------------------------------------------
 
-    private fun buildCompositeAlphaMask(mask: Bitmap, blurRadius: Float): Bitmap {
+    private fun buildCompositeAlphaMask(mask: Bitmap): Bitmap {
+        val blurRadius = 12f
         val w = mask.width
         val h = mask.height
         val total = w * h

@@ -14,6 +14,9 @@ import android.widget.Toast
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.graphics.scale
+import androidx.core.graphics.createBitmap
+import androidx.core.graphics.toColorInt
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.updatePadding
@@ -41,11 +44,12 @@ class MainActivity : AppCompatActivity() {
     private var objectSnapper: ObjectSnapper? = null
     @Suppress("unused")
     private var imageUpscaler: ImageUpscaler? = null
+    @Suppress("unused")
     private var mInterstitialAd: Any? = null
     private val nativeProcessor = NativeProcessor()
     
-    private val activeColor = Color.parseColor("#3DDC84")
-    private val inactiveColor = Color.parseColor("#777777")
+    private val activeColor = "#3DDC84".toColorInt()
+    private val inactiveColor = "#777777".toColorInt()
     
     private val imagePicker = registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
         uri?.let { 
@@ -58,7 +62,7 @@ class MainActivity : AppCompatActivity() {
             currentBitmap = it
             binding.imageView.setImageBitmap(it)
             binding.maskView.setImage(it)
-            updateEmptyState(true)
+            updateEmptyState(isImageLoaded = true)
         }
     }
     
@@ -85,7 +89,7 @@ class MainActivity : AppCompatActivity() {
         }
         
         setupUI()
-        updateEmptyState(false)
+        updateEmptyState(isImageLoaded = false)
     }
     
     private fun setupUI() {
@@ -133,8 +137,8 @@ class MainActivity : AppCompatActivity() {
 
             val deferredResult = lifecycleScope.async(Dispatchers.Default) {
                 try {
-                    val mask = if (rawMask.width != image.width || rawMask.height != image.height) {
-                        Bitmap.createScaledBitmap(rawMask, image.width, image.height, true)
+                    val mask = if ((rawMask.width != image.width) || (rawMask.height != image.height)) {
+                        rawMask.scale(image.width, image.height, filter = true)
                     } else {
                         rawMask
                     }
@@ -144,14 +148,14 @@ class MainActivity : AppCompatActivity() {
                             Toast.makeText(
                                 this@MainActivity,
                                 "AI engine unavailable (${objectRemoverError ?: "not loaded yet"}) — using basic repair",
-                                Toast.LENGTH_LONG
+                                Toast.LENGTH_LONG,
                             ).show()
                         }
                     }
                     val result = if (remover != null) {
                         remover.removeObject(image, mask)
                     } else {
-                        val fallback = Bitmap.createBitmap(image.width, image.height, Bitmap.Config.ARGB_8888)
+                        val fallback = createBitmap(image.width, image.height, Bitmap.Config.ARGB_8888)
                         val status = nativeProcessor.processImage(image, mask, fallback)
                         if (status != 0) {
                             fallback.recycle()
@@ -172,15 +176,15 @@ class MainActivity : AppCompatActivity() {
                             Toast.makeText(
                                 this@MainActivity,
                                 "Basic repair used (AI fill rejected: $reason)",
-                                Toast.LENGTH_LONG
+                                Toast.LENGTH_LONG,
                             ).show()
                         }
                     }
                     withContext(Dispatchers.Main) {
                         val label = when {
                             remover == null -> "basic repair · engine unavailable"
-                            remover?.lastRunDegraded != null ->
-                                "basic repair · ${remover?.lastRunDegraded}"
+                            remover.lastRunDegraded != null ->
+                                "basic repair · ${remover.lastRunDegraded}"
                             else -> "AI fill (big-lama)"
                         }
                         showEngineBadge(label)
@@ -214,7 +218,7 @@ class MainActivity : AppCompatActivity() {
         binding.engineBadge.visibility = View.VISIBLE
         binding.engineBadge.postDelayed(
             { binding.engineBadge.visibility = View.GONE },
-            4000
+            4000,
         )
     }
 
@@ -287,7 +291,7 @@ class MainActivity : AppCompatActivity() {
                 val scale = maxDimension.toFloat() / maxOf(rawBitmap.width, rawBitmap.height)
                 val w = (rawBitmap.width * scale).toInt()
                 val h = (rawBitmap.height * scale).toInt()
-                Bitmap.createScaledBitmap(rawBitmap, w, h, true).also { rawBitmap.recycle() }
+                rawBitmap.scale(w, h, true).also { rawBitmap.recycle() }
             } else {
                 rawBitmap
             }
@@ -297,7 +301,7 @@ class MainActivity : AppCompatActivity() {
                     currentBitmap = it
                     binding.imageView.setImageBitmap(it)
                     binding.maskView.setImage(it)
-                    updateEmptyState(true)
+                    updateEmptyState(isImageLoaded = true)
                 }
             }
         }

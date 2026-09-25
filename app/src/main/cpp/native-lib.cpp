@@ -233,6 +233,102 @@ Java_com_example_magicimagepro_ml_NativeProcessor_processImage(
     return 0;
 }
 
+// ----------------------------------------------------------------------------
+// Polish a generative (LaMa) fill.
+//
+// The model runs at a fixed 512x512, so a large hole comes back structurally
+// right but visibly smooth. inpaint_engine::refineFill copies the photo's own
+// fine detail into the masked area and blends the rim tight, which is what
+// stops a removed object from leaving a soft patch in an otherwise grainy
+// photo. Only the masked area is touched.
+// ----------------------------------------------------------------------------
+extern "C" JNIEXPORT jint JNICALL
+Java_com_example_magicimagepro_ml_NativeProcessor_refineFill(
+        JNIEnv* env,
+        jobject /* this */,
+        jobject original,
+        jobject filled,
+        jobject mask,
+        jobject outBitmap) {
+
+    AndroidBitmapInfo infoOrig, infoFilled, infoMask, infoOut;
+    void *pixelsOrig = nullptr, *pixelsFilled = nullptr, *pixelsMask = nullptr, *pixelsOut = nullptr;
+
+    if (AndroidBitmap_getInfo(env, original, &infoOrig) != ANDROID_BITMAP_RESULT_SUCCESS) return -1;
+    if (AndroidBitmap_getInfo(env, filled, &infoFilled) != ANDROID_BITMAP_RESULT_SUCCESS) return -2;
+    if (AndroidBitmap_getInfo(env, mask, &infoMask) != ANDROID_BITMAP_RESULT_SUCCESS) return -3;
+    if (AndroidBitmap_getInfo(env, outBitmap, &infoOut) != ANDROID_BITMAP_RESULT_SUCCESS) return -4;
+
+    if (infoOrig.width != infoFilled.width || infoOrig.height != infoFilled.height ||
+        infoOrig.width != infoMask.width || infoOrig.height != infoMask.height ||
+        infoOrig.width != infoOut.width || infoOrig.height != infoOut.height) {
+        return -5;
+    }
+
+    if (infoOrig.stride != infoOrig.width * 4 ||
+        infoFilled.stride != infoFilled.width * 4 ||
+        infoMask.stride != infoMask.width * 4 ||
+        infoOut.stride != infoOut.width * 4) {
+        return -6;
+    }
+
+    if (AndroidBitmap_lockPixels(env, original, &pixelsOrig) != ANDROID_BITMAP_RESULT_SUCCESS) return -7;
+    if (AndroidBitmap_lockPixels(env, filled, &pixelsFilled) != ANDROID_BITMAP_RESULT_SUCCESS) {
+        AndroidBitmap_unlockPixels(env, original);
+        return -8;
+    }
+    if (AndroidBitmap_lockPixels(env, mask, &pixelsMask) != ANDROID_BITMAP_RESULT_SUCCESS) {
+        AndroidBitmap_unlockPixels(env, filled);
+        AndroidBitmap_unlockPixels(env, original);
+        return -9;
+    }
+    if (AndroidBitmap_lockPixels(env, outBitmap, &pixelsOut) != ANDROID_BITMAP_RESULT_SUCCESS) {
+        AndroidBitmap_unlockPixels(env, mask);
+        AndroidBitmap_unlockPixels(env, filled);
+        AndroidBitmap_unlockPixels(env, original);
+        return -10;
+    }
+
+    cv::Mat srcMat(static_cast<int>(infoOrig.height), static_cast<int>(infoOrig.width), CV_8UC4, pixelsOrig);
+    cv::Mat fillMat(static_cast<int>(infoFilled.height), static_cast<int>(infoFilled.width), CV_8UC4, pixelsFilled);
+    cv::Mat maskMat(static_cast<int>(infoMask.height), static_cast<int>(infoMask.width), CV_8UC4, pixelsMask);
+    cv::Mat outMat(static_cast<int>(infoOut.height), static_cast<int>(infoOut.width), CV_8UC4, pixelsOut);
+
+    cv::Mat srcRgb, fillRgb, grayMask, binMask;
+    cv::cvtColor(srcMat, srcRgb, cv::COLOR_RGBA2RGB);
+    cv::cvtColor(fillMat, fillRgb, cv::COLOR_RGBA2RGB);
+    cv::cvtColor(maskMat, grayMask, cv::COLOR_RGBA2GRAY);
+    cv::threshold(grayMask, binMask, 127, 255, cv::THRESH_BINARY);
+
+    cv::Mat refined;
+    try {
+        refined = inpaint_engine::refineFill(srcRgb, binMask, fillRgb);
+    } catch (const cv::Exception& e) {
+        LOGW("refineFill failed: %s", e.what());
+        refined = fillRgb.clone();
+    }
+
+    std::vector<cv::Mat> origRgbaChannels(4);
+    cv::split(srcMat, origRgbaChannels);
+    std::vector<cv::Mat> refinedChannels(3);
+    cv::split(refined, refinedChannels);
+
+    std::vector<cv::Mat> outRgbaChannels = {
+        refinedChannels[0],
+        refinedChannels[1],
+        refinedChannels[2],
+        origRgbaChannels[3]
+    };
+    cv::merge(outRgbaChannels, outMat);
+
+    AndroidBitmap_unlockPixels(env, original);
+    AndroidBitmap_unlockPixels(env, filled);
+    AndroidBitmap_unlockPixels(env, mask);
+    AndroidBitmap_unlockPixels(env, outBitmap);
+
+    return 0;
+}
+
 extern "C" JNIEXPORT jint JNICALL
 Java_com_example_magicimagepro_ml_NativeProcessor_seamlessComposite(
         JNIEnv* env,

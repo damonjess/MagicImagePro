@@ -17,6 +17,7 @@
 #include <opencv2/photo.hpp>
 
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <cstdint>
 #include <vector>
@@ -487,6 +488,213 @@ static cv::Mat fillHole(const cv::Mat& srcBgr, const cv::Mat& holeMask) {
     // 5) Grain matching.
     float grain = estimateGrain(srcBgr, hole);
     applyGrain(filled, hole, grain);
+
+    return filled;
+}
+
+// ---------------------------------------------------------------------------
+// Texture transfer: borrow the photo's own fine detail for a generated fill.
+//
+// A generative fill gets the global structure right - where the pavement ends
+// and the grass begins - but it runs at a small fixed resolution, so a large
+// hole comes back visibly smooth. Real grass, concrete and fabric are full of
+// fine detail that a smooth fill does not have, and that missing detail is the
+// strongest remaining tell that something was removed.
+//
+// Every masked pixel looks for the unmasked pixel whose blurred surroundings
+// are most similar to its own, and copies that pixel's high-frequency detail on
+// top of the fill. The structure comes from the model, the texture from the
+// photo itself, so the hole ends up with the same grain and structure as its
+// surroundings instead of a soft patch.
+//
+// The detail band is deliberately narrow (detailSigma): only the photo's fine
+// grain is borrowed, never its structure. Copying a wider band drags real
+// shapes along with the offset field and shows up as swirls in the fill, which
+// was measurably worse than leaving the hole smooth.
+// ---------------------------------------------------------------------------
+
+static void transferTexture(cv::Mat& img, const cv::Mat& original,
+                            const cv::Mat& hole, float strength = 0.8f,
+                            int cell = 14, double offsetSigma = 0.5,
+                            double detailSigma = 2.5, double postSigma = 12.0) {
+    CV_Assert(img.size() == original.size());
+    const int W = img.cols, H = img.rows;
+    if (cv::countNonZero(hole) == 0) return;
+
+    cv::Mat origF, imgF;
+    original.convertTo(origF, CV_32FC3);
+    img.convertTo(imgF, CV_32FC3);
+
+    cv::Mat baseOrig, baseFill;
+    cv::GaussianBlur(origF, baseOrig, cv::Size(0, 0), detailSigma);
+    cv::GaussianBlur(imgF, baseFill, cv::Size(0, 0), detailSigma);
+    cv::Mat detail = origF - baseOrig;   // real fine detail outside the hole
+
+    // --- coarse nearest-neighbour match on blurred colours -----------------
+    const int gw = (W + cell - 1) / cell;
+    const int gh = (H + cell - 1) / cell;
+    cv::Mat holeF, cov, coarse;
+    hole.convertTo(holeF, CV_32F, 1.0 / 255.0);
+    cv::resize(holeF, cov, cv::Size(gw, gh), 0, 0, cv::INTER_AREA);
+    cv::resize(baseFill, coarse, cv::Size(gw, gh), 0, 0, cv::INTER_AREA);
+
+    std::vector<cv::Point> holeCells, sourceCells;
+    std::vector<cv::Vec3f> holeVal, sourceVal;
+    for (int gy = 0; gy < gh; ++gy) {
+        const float* cp = cov.ptr<float>(gy);
+        const cv::Vec3f* fp = coarse.ptr<cv::Vec3f>(gy);
+        for (int gx = 0; gx < gw; ++gx) {
+            if (cp[gx] > 0.002f) {
+                holeCells.emplace_back(gx, gy);
+                holeVal.push_back(fp[gx]);
+            } else if (cp[gx] <= 0.0f) {
+                // Donor cells must be clear of the hole, including their
+                // neighbours, so no removed-object remnant leaks into the fill.
+                bool clear = true;
+                for (int ny = -1; ny <= 1 && clear; ++ny) {
+                    for (int nx = -1; nx <= 1; ++nx) {
+                        const int cx = gx + nx, cy = gy + ny;
+                        if (cx < 0 || cy < 0 || cx >= gw || cy >= gh) continue;
+                        if (cov.at<float>(cy, cx) > 0.0f) { clear = false; break; }
+                    }
+                }
+                if (clear) {
+                    sourceCells.emplace_back(gx, gy);
+                    sourceVal.push_back(fp[gx]);
+                }
+            }
+        }
+    }
+    if (holeCells.empty() || sourceCells.empty()) return;
+
+    cv::Mat offX = cv::Mat::zeros(gh, gw, CV_32F);
+    cv::Mat offY = cv::Mat::zeros(gh, gw, CV_32F);
+    for (size_t i = 0; i < holeCells.size(); ++i) {
+        const cv::Vec3f& q = holeVal[i];
+        float best = FLT_MAX;
+        int bestJ = -1;
+        for (size_t j = 0; j < sourceCells.size(); ++j) {
+            const cv::Vec3f& s = sourceVal[j];
+            const float dr = q[0] - s[0], dg = q[1] - s[1], db = q[2] - s[2];
+            const float d = dr * dr + dg * dg + db * db;
+            if (d < best) { best = d; bestJ = (int)j; }
+        }
+        if (bestJ < 0) continue;
+        const cv::Point& h = holeCells[i];
+        const cv::Point& s = sourceCells[bestJ];
+        offX.at<float>(h) = static_cast<float>((s.x - h.x) * cell);
+        offY.at<float>(h) = static_cast<float>((s.y - h.y) * cell);
+    }
+
+    // Barely smooth the donor field. Smoothing it more makes neighbouring
+    // pixels pull their detail from places that rotate and scale relative to
+    // each other, and warping fine texture that way draws faint spirals across
+    // the result. A lightly smoothed field keeps the texture coherent without
+    // deforming it; measured against the photo's own texture this needed a
+    // lower strength too, so both knobs moved together.
+    // NB: this field lives on the coarse grid, so sigma is measured in cells.
+    // A tiny sigma means "keep each cell's own donor", which rigidly copies
+    // blocks of texture instead of warping it - see the note in the apply loop.
+    if (offsetSigma > 0.05) {
+        cv::GaussianBlur(offX, offX, cv::Size(0, 0), offsetSigma);
+        cv::GaussianBlur(offY, offY, cv::Size(0, 0), offsetSigma);
+    }
+    cv::Mat offXBig, offYBig;
+    cv::resize(offX, offXBig, cv::Size(W, H), 0, 0, cv::INTER_LINEAR);
+    cv::resize(offY, offYBig, cv::Size(W, H), 0, 0, cv::INTER_LINEAR);
+
+    // Feather the added detail in from the rim so the hole boundary stays exact.
+    cv::Mat dist;
+    cv::distanceTransform(hole, dist, cv::DIST_L2, 3);
+    const float ramp = std::max(16.0f, static_cast<float>(cell) * 2.5f);
+
+    // Sample the borrowed detail through the donor field first. Warping fine
+    // texture with a smooth field inevitably folds it into low-frequency
+    // whorls, and those whorls are far more visible than the grain they came
+    // from - they read as faint spirals drawn on the pavement. Removing the
+    // warped sample's own local average leaves only the texture that was
+    // wanted, so the field can be as smooth as the match needs.
+    cv::Mat warped;
+    detail.copyTo(warped);
+    cv::Mat sampled = cv::Mat::zeros(H, W, CV_8U);
+
+    for (int y = 0; y < H; ++y) {
+        const uchar* m = hole.ptr<uchar>(y);
+        const float* ox = offXBig.ptr<float>(y);
+        const float* oy = offYBig.ptr<float>(y);
+        uchar* sp = sampled.ptr<uchar>(y);
+        for (int x = 0; x < W; ++x) {
+            if (m[x] == 0) continue;
+            // Walk back towards the pixel if the donor drifted into the hole.
+            float scale = 1.0f;
+            int dx = 0, dy = 0;
+            bool ok = false;
+            for (int attempt = 0; attempt < 6 && !ok; ++attempt) {
+                dx = std::clamp(x + static_cast<int>(std::lround(ox[x] * scale)), 0, W - 1);
+                dy = std::clamp(y + static_cast<int>(std::lround(oy[x] * scale)), 0, H - 1);
+                ok = hole.at<uchar>(dy, dx) == 0;
+                scale *= 0.5f;
+            }
+            if (!ok) {
+                warped.at<cv::Vec3f>(y, x) = cv::Vec3f(0.f, 0.f, 0.f);
+                continue;
+            }
+            warped.at<cv::Vec3f>(y, x) = detail.at<cv::Vec3f>(dy, dx);
+            sp[x] = 1;
+        }
+    }
+
+    if (postSigma > 0.5) {
+        cv::Mat warpedLow;
+        cv::GaussianBlur(warped, warpedLow, cv::Size(0, 0), postSigma);
+        cv::subtract(warped, warpedLow, warped);
+    }
+
+    for (int y = 0; y < H; ++y) {
+        const uchar* m = hole.ptr<uchar>(y);
+        const uchar* sp = sampled.ptr<uchar>(y);
+        const float* d = dist.ptr<float>(y);
+        const cv::Vec3f* nzp = warped.ptr<cv::Vec3f>(y);
+        cv::Vec3f* p = imgF.ptr<cv::Vec3f>(y);
+        for (int x = 0; x < W; ++x) {
+            if (m[x] == 0 || sp[x] == 0) continue;
+            float t = std::clamp(d[x] / ramp, 0.0f, 1.0f);
+            t = t * t * (3.0f - 2.0f * t);
+            if (t <= 0.f) continue;
+            const float k = strength * t;
+            p[x][0] = std::clamp(p[x][0] + nzp[x][0] * k, 0.0f, 255.0f);
+            p[x][1] = std::clamp(p[x][1] + nzp[x][1] * k, 0.0f, 255.0f);
+            p[x][2] = std::clamp(p[x][2] + nzp[x][2] * k, 0.0f, 255.0f);
+        }
+    }
+    imgF.convertTo(img, CV_8UC3);
+}
+
+// ---------------------------------------------------------------------------
+// Refine an externally produced fill (e.g. a generative model's output).
+//
+// The model supplies the structure; transferTexture then borrows the photo's
+// own fine detail on top of it, and the seam is blended tight against the
+// original. Grain is left to the caller so it is only applied once.
+// ---------------------------------------------------------------------------
+
+static cv::Mat refineFill(const cv::Mat& srcBgr, const cv::Mat& holeMask,
+                          const cv::Mat& initBgr) {
+    CV_Assert(srcBgr.type() == CV_8UC3);
+    CV_Assert(holeMask.type() == CV_8UC1);
+    CV_Assert(srcBgr.size() == holeMask.size());
+    CV_Assert(initBgr.size() == srcBgr.size());
+
+    cv::Mat hole;
+    cv::threshold(holeMask, hole, 127, 255, cv::THRESH_BINARY);
+    if (cv::countNonZero(hole) == 0) return srcBgr.clone();
+
+    // Inside the hole take the generated fill; outside it take the real photo.
+    cv::Mat filled = initBgr.clone();
+    srcBgr.copyTo(filled, ~hole);
+
+    transferTexture(filled, srcBgr, hole);
+    blendSeam(srcBgr, filled, hole);
 
     return filled;
 }

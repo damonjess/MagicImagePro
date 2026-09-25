@@ -3,7 +3,10 @@
 // Runs the content-aware fill on a real photo + mask and writes
 // side-by-side results for visual inspection.
 //
-// Usage: ./inpaint_test <image> <mask> <out_prefix>
+// Usage: ./inpaint_test <image> <mask> <out_prefix> [initImage]
+//
+// When <initImage> is given it is treated as an externally produced fill of
+// the same mask (e.g. a LaMa output) and re-textured by the engine.
 //
 #include "inpaint_engine.h"
 
@@ -53,5 +56,32 @@ int main(int argc, char** argv) {
     cv::imwrite(std::string(argv[3]) + "_filled.png", filled);
 
     std::printf("wrote %s_compare.png and %s_filled.png\n", argv[3], argv[3]);
+
+    if (argc >= 5) {
+        cv::Mat init = cv::imread(argv[4]);
+        if (init.empty()) {
+            std::printf("failed to load init image %s\n", argv[4]);
+            return 1;
+        }
+        if (init.size() != img.size()) {
+            cv::resize(init, init, img.size(), 0, 0, cv::INTER_CUBIC);
+        }
+        double t2 = (double)cv::getTickCount();
+        cv::Mat refined = inpaint_engine::refineFill(img, mask, init);
+        double t3 = (double)cv::getTickCount();
+        std::printf("refineFill: %.2f s\n", (t3 - t2) / cv::getTickFrequency());
+        cv::imwrite(std::string(argv[3]) + "_refined.png", refined);
+
+        cv::Mat iS, rS;
+        cv::resize(init, iS, cv::Size(), sc, sc);
+        cv::resize(refined, rS, cv::Size(), sc, sc);
+        cv::Mat canvas2(cv::Size(W * 4 + 30, oS.rows), CV_8UC3, cv::Scalar(30, 30, 30));
+        oS.copyTo(canvas2(cv::Rect(0, 0, oS.cols, oS.rows)));
+        tS.copyTo(canvas2(cv::Rect(W + 10, 0, tS.cols, tS.rows)));
+        iS.copyTo(canvas2(cv::Rect(2 * W + 20, 0, iS.cols, iS.rows)));
+        rS.copyTo(canvas2(cv::Rect(3 * W + 30, 0, rS.cols, rS.rows)));
+        cv::imwrite(std::string(argv[3]) + "_compare4.png", canvas2);
+        std::printf("wrote %s_refined.png and %s_compare4.png\n", argv[3], argv[3]);
+    }
     return 0;
 }

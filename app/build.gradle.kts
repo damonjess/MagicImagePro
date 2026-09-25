@@ -13,13 +13,17 @@ android {
         applicationId = "com.example.magicimagepro"
         minSdk = 26
         targetSdk = 35
-        versionCode = 3
-        versionName = "1.2-content-fill"
+        versionCode = 5
+        versionName = "1.4-clean-texture"
         
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         ndk {
-            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+            // NB: 32-bit x86 is deliberately absent - OpenCV's bundled IPP-ICV
+            // x86 objects cannot be linked by NDK 27's lld ("data is too
+            // short" in .note.gnu.property) and the failure breaks every ABI's
+            // build. x86_64 still covers the emulator.
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
         }
 
         externalNativeBuild {
@@ -62,6 +66,7 @@ android {
     }
 }
 
+@Suppress("GradleDependency")
 dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.appcompat)
@@ -74,20 +79,21 @@ dependencies {
 
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.30.0")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
-    implementation("com.google.code.gson:gson:2.10.1")
+    implementation("com.google.code.gson:gson:2.11.0")
     implementation("com.alibaba.android:mnn:0.0.8")
 
     testImplementation("junit:junit:4.13.2")
-    androidTestImplementation("androidx.test.ext:junit:1.1.5")
-    androidTestImplementation("androidx.test.espresso:espresso-core:3.5.1")
+    androidTestImplementation("androidx.test.ext:junit:1.2.1")
+    androidTestImplementation("androidx.test.espresso:espresso-core:3.6.1")
 }
 
 val copyTfliteSo by tasks.registering(Copy::class) {
+    description = "Copies TensorFlow Lite native libraries to jniLibs"
     val cfg = configurations.detachedConfiguration(dependencies.create("org.tensorflow:tensorflow-lite:2.17.0"))
     duplicatesStrategy = DuplicatesStrategy.WARN
-    from({
-        cfg.files.map { zipTree(it) }
-    }) {
+    from(
+        { cfg.files.map { zipTree(it) } },
+    ) {
         include("jni/**/libtensorflowlite_jni.so", "jni/**/libtensorflowlite.so")
         eachFile {
             val abi = file.parentFile.name
@@ -99,6 +105,7 @@ val copyTfliteSo by tasks.registering(Copy::class) {
 }
 
 val downloadTfliteHeaders by tasks.registering {
+    description = "Downloads TensorFlow Lite headers"
     val destDir = layout.projectDirectory.dir("src/main/cpp/include")
     outputs.dir(destDir)
     doLast {
